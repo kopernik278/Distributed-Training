@@ -3,7 +3,23 @@
 Mini LLM training infrastructure project for AI Infra / Distributed Training
 Engineer interviews.
 
-Long-term context and learning background: [`AI_INFRA_CONTEXT.md`](./AI_INFRA_CONTEXT.md).
+Long-term learning context: [`AI_INFRA_CONTEXT.md`](./AI_INFRA_CONTEXT.md)
+
+## Development mode (canonical)
+
+```text
+Cursor  +  GitHub  +  RunPod
+```
+
+- **Cursor**: design, implement, test scaffolding, docs/RFC
+- **GitHub**: source of truth and reproducible commit history
+- **RunPod**: real GPU / multi-GPU / NCCL execution and profiling
+
+Workflow docs:
+
+- [`docs/ops/cursor-github-runpod-workflow.md`](./docs/ops/cursor-github-runpod-workflow.md)
+- [`docs/ops/runpod-setup-guide.md`](./docs/ops/runpod-setup-guide.md)
+- [`docs/ops/enterprise-stack.md`](./docs/ops/enterprise-stack.md)
 
 ## Current milestone
 
@@ -15,78 +31,63 @@ Long-term context and learning background: [`AI_INFRA_CONTEXT.md`](./AI_INFRA_CO
 - forward / backward / optimizer timing breakdown
 - correctness tests
 - DDP scaling benchmark script
+- RunPod GPU launch scripts
 - RFC + experiment documentation
-
-This intentionally comes before Tensor Parallelism / Pipeline Parallelism /
-Checkpoint Resharding. If the baseline training loop and metrics are not
-trustworthy, later optimization claims become weak.
 
 ## Repository layout
 
 ```text
 AI_INFRA_CONTEXT.md
+configs/
+  phase1_gpu_smoke.yaml
 src/mini_training/
-  config.py
-  data.py
-  distributed.py
-  model.py
-  train.py
 scripts/
   run_single_node_ddp.sh
   benchmark_ddp_scaling.sh
+  runpod/
+    bootstrap.sh
+    check_gpu_env.sh
+    run_ddp_gpu.sh
+    run_ddp_multinode.sh
 tests/
-  test_phase1_correctness.py
 docs/
-  design/RFC-001-phase1-ddp-baseline.md
-  experiments/phase1-ddp-scaling.md
-  phase1-roadmap.md
-  phase1-implementation-notes.md
+  design/
+  experiments/
+  ops/
+requirements/
+  gpu.txt
 ```
 
-## Install
+## Install (CPU / Cursor machine)
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e .
+python3 -m pip install -e .
 ```
 
-If `venv` is unavailable:
-
-```bash
-python3 -m pip install --break-system-packages torch
-python3 -m pip install --break-system-packages -e .
-```
-
-## Run
-
-### Single process smoke test
+CPU smoke:
 
 ```bash
 python3 -m mini_training.train --steps 5 --batch-size 2 --seq-len 64
-```
-
-### Single-node DDP
-
-```bash
-chmod +x scripts/run_single_node_ddp.sh
-NPROC_PER_NODE=2 ./scripts/run_single_node_ddp.sh --steps 10 --batch-size 4 --seq-len 128
-```
-
-When CUDA is available, the code uses NCCL. On CPU-only machines it falls back
-to Gloo so the training loop can still be validated.
-
-### Correctness tests
-
-```bash
 python3 -m unittest discover -s tests -v
 ```
 
-### Scaling benchmark
+## Run on RunPod (GPU)
+
+Follow [`docs/ops/runpod-setup-guide.md`](./docs/ops/runpod-setup-guide.md), then:
 
 ```bash
-chmod +x scripts/benchmark_ddp_scaling.sh
-WORLD_SIZES=1,2 BACKEND=gloo STEPS=6 ./scripts/benchmark_ddp_scaling.sh
+./scripts/runpod/bootstrap.sh
+./scripts/runpod/check_gpu_env.sh
+./scripts/runpod/run_ddp_gpu.sh 1
+./scripts/runpod/run_ddp_gpu.sh 2
+```
+
+Scaling benchmark on GPU:
+
+```bash
+WORLD_SIZES=1,2 BACKEND=nccl STEPS=20 \
+OUT_DIR=results/phase1_runpod_gpu \
+./scripts/benchmark_ddp_scaling.sh
 ```
 
 ## Metrics
@@ -101,20 +102,19 @@ Each step logs:
 - `rank_tokens_per_second`
 - `global_tokens_per_second`
 
-Metrics files also include:
-
-- environment metadata (device, backend, commit, PyTorch version)
-- summary averages after warm-up discard
+Metrics files also include environment metadata (device, backend, commit, GPU name when available).
 
 ## Important rule
 
-Never report fabricated performance numbers. CPU Gloo smoke results are useful
-for correctness and instrumentation checks, but are **not** GPU / NCCL training
-portfolio claims.
+Never report fabricated performance numbers.
+
+- CPU/Gloo results: instrumentation only
+- RunPod CUDA/NCCL results: valid portfolio measurements (with hardware metadata)
 
 ## Next stages (Project 1)
 
-1. Tensor Parallel Linear (`ColumnParallel` / `RowParallel`)
-2. Pipeline Parallel + 1F1B
-3. Distributed Checkpoint save/resume/reshard
-4. Profiling hooks and communication/computation overlap
+1. RunPod single-node NCCL DDP baseline table
+2. Tensor Parallel Linear (`ColumnParallel` / `RowParallel`)
+3. Pipeline Parallel + 1F1B
+4. Distributed Checkpoint save/resume/reshard
+5. Profiling hooks and communication/computation overlap

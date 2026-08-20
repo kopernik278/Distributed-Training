@@ -1,0 +1,14 @@
+# Phase-1 GPU smoke defaults for RunPod single-node DDP.
+# These are documentation defaults consumed by scripts via environment variables.
+
+steps: 20
+batch_size: 8
+seq_len: 256
+hidden_size: 256
+num_layers: 4
+num_heads: 8
+backend: nccl
+warmup_discard: 2
+notes: >
+  Use with scripts/runpod/run_ddp_gpu.sh.
+  Increase model size only after 1/2 GPU smoke tests pass.

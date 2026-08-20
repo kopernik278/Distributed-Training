@@ -1,0 +1,10 @@
+# GPU runtime extras for RunPod bring-up.
+# The base package still depends on torch from the selected Pod template.
+
+# Keep this file intentionally lean. Prefer the RunPod PyTorch template's torch/CUDA stack.
+# Add optional experiment tooling here when needed.
+
+# Example optional tools (uncomment when you decide to use them):
+# wandb
+# nvitop
+# py-spy

@@ -6,3 +6,6 @@ single_metrics.json
 ddp_metrics.json
 results/
 profiles/
+checkpoints/
+*.pt
+*.pth

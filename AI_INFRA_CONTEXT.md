@@ -695,7 +695,13 @@ If GPU hardware is unavailable:
 
 ---
 
-## 10. ChatGPT ↔ Cursor Workflow
+## 10. ChatGPT ↔ Cursor ↔ GitHub ↔ RunPod Workflow
+
+Canonical development mode for this repository:
+
+```text
+Cursor + GitHub + RunPod
+```
 
 Use ChatGPT primarily for:
 
@@ -718,6 +724,19 @@ Use Cursor primarily for:
 - incremental code changes
 - Git workflow
 
+Use GitHub as:
+
+- source of truth
+- PR/review history
+- reproducible commit hash for every experiment
+
+Use RunPod as:
+
+- CUDA/NCCL execution environment
+- single-node multi-GPU training
+- later multi-node Instant Clusters
+- profiling host for Nsight / benchmarks
+
 Recommended loop:
 
 ```text
@@ -729,15 +748,15 @@ Design RFC
   ↓
 Cursor
   ↓
-Implement
+Implement + push GitHub branch
   ↓
-GPU server
+RunPod (git pull)
   ↓
-Benchmark
+Benchmark / train on GPU
   ↓
 Nsight / Profiler
   ↓
-Results
+Results committed as notes/metrics summaries
   ↓
 ChatGPT
   ↓
@@ -747,8 +766,14 @@ Cursor
   ↓
 Optimize
   ↓
-Benchmark again
+Benchmark again on RunPod
 ```
+
+See also:
+
+- `docs/ops/cursor-github-runpod-workflow.md`
+- `docs/ops/runpod-setup-guide.md`
+- `docs/ops/enterprise-stack.md`
 
 ---
 
