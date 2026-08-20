@@ -7,6 +7,18 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 
+PYTHON_BIN="${PYTHON_BIN:-}"
+if [[ -z "${PYTHON_BIN}" ]]; then
+  if [[ -x "${ROOT_DIR}/.venv/bin/python" ]]; then
+    PYTHON_BIN="${ROOT_DIR}/.venv/bin/python"
+  else
+    PYTHON_BIN=python3
+  fi
+fi
+if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1 && [[ ! -x "${PYTHON_BIN}" ]]; then
+  PYTHON_BIN=python
+fi
+
 WORLD_SIZES="${WORLD_SIZES:-1,2}"
 STEPS="${STEPS:-6}"
 BATCH_SIZE="${BATCH_SIZE:-2}"
@@ -28,7 +40,7 @@ for world_size in "${WORLD_SIZE_ARRAY[@]}"; do
   echo "[benchmark] world_size=${world_size} backend=${BACKEND} -> ${metrics_path}"
 
   if [[ "${world_size}" -eq 1 ]]; then
-    python3 -m mini_training.train \
+    "${PYTHON_BIN}" -m mini_training.train \
       --steps "${STEPS}" \
       --batch-size "${BATCH_SIZE}" \
       --seq-len "${SEQ_LEN}" \
@@ -39,7 +51,7 @@ for world_size in "${WORLD_SIZE_ARRAY[@]}"; do
       --warmup-discard "${WARMUP_DISCARD}" \
       --metrics-path "${metrics_path}"
   else
-    python3 -m torch.distributed.run \
+    "${PYTHON_BIN}" -m torch.distributed.run \
       --nnodes 1 \
       --nproc_per_node "${world_size}" \
       -m mini_training.train \
@@ -55,7 +67,7 @@ for world_size in "${WORLD_SIZE_ARRAY[@]}"; do
   fi
 done
 
-python3 - <<'PY'
+"${PYTHON_BIN}" - <<'PY'
 import json
 import os
 from pathlib import Path
