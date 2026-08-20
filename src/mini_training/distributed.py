@@ -37,7 +37,19 @@ def init_distributed(backend: str) -> tuple[torch.device, int, str]:
     device = infer_device()
     actual_backend = backend if device.type == "cuda" else "gloo"
     if world_size > 1 and not dist.is_initialized():
-        dist.init_process_group(backend=actual_backend, timeout=torch.distributed.constants.default_pg_timeout)
+        init_kwargs = {
+            "backend": actual_backend,
+            "timeout": torch.distributed.constants.default_pg_timeout,
+        }
+        # PyTorch >= 2.x recommends passing device_id for NCCL to avoid ambiguous rank-device mapping.
+        if device.type == "cuda" and device.index is not None:
+            init_kwargs["device_id"] = device
+        try:
+            dist.init_process_group(**init_kwargs)
+        except TypeError:
+            # Older torch without device_id support.
+            init_kwargs.pop("device_id", None)
+            dist.init_process_group(**init_kwargs)
     return device, world_size, actual_backend
 
 

@@ -1,0 +1,33 @@
+{
+  "environment": {
+    "timestamp_utc": "2026-08-20T18:16:13.266196+00:00",
+    "commit": "66eb3f1",
+    "python": "3.12.3",
+    "platform": "Linux-6.8.0-57-generic-x86_64-with-glibc2.39",
+    "pytorch": "2.8.0+cu128",
+    "cuda_available": true,
+    "device": "cuda:0",
+    "backend": "nccl",
+    "world_size": 2,
+    "rank": 0,
+    "local_rank": 0,
+    "tensor_parallel_size": 2,
+    "tensor_parallel_rank": 0,
+    "data_parallel_size": 1,
+    "cuda_version": "12.8",
+    "gpu_name": "NVIDIA GeForce RTX 3090",
+    "gpu_count": 2,
+    "nccl_version": "2.27.3"
+  },
+  "summary": {
+    "num_steps": 18,
+    "warmup_discard": 2,
+    "avg_loss": 8.36455602116055,
+    "avg_step_time_ms": 15.201200666423473,
+    "avg_forward_ms": 6.540327669224805,
+    "avg_backward_ms": 7.807464843305449,
+    "avg_optimizer_ms": 0.7204383016667433,
+    "avg_rank_tokens_per_second": 134867.34031706027,
+    "avg_global_tokens_per_second": 134785.3306526737
+  }
+}
