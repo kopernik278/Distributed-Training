@@ -1,0 +1,30 @@
+{
+  "runs": [
+    {
+      "world_size": 1,
+      "backend": "nccl",
+      "device": "cuda:0",
+      "cuda_available": true,
+      "avg_global_tokens_per_second": 166468.11337963262,
+      "avg_step_time_ms": 12.782010301533672,
+      "avg_forward_ms": 3.621452022343874,
+      "avg_backward_ms": 7.644787896424532,
+      "avg_optimizer_ms": 1.3248383377989132,
+      "metrics_file": "results/phase1_runpod_gpu/ws1.json",
+      "scaling_efficiency": 1.0
+    },
+    {
+      "world_size": 2,
+      "backend": "nccl",
+      "device": "cuda:0",
+      "cuda_available": true,
+      "avg_global_tokens_per_second": 199363.6649748859,
+      "avg_step_time_ms": 20.728880306705832,
+      "avg_forward_ms": 3.3092850612269507,
+      "avg_backward_ms": 16.11736269357304,
+      "avg_optimizer_ms": 1.1380405889617071,
+      "metrics_file": "results/phase1_runpod_gpu/ws2.json",
+      "scaling_efficiency": 0.5988043623712926
+    }
+  ]
+}
