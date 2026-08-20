@@ -22,9 +22,13 @@ class TrainingConfig:
     log_interval: int = 1
     backend: str = "nccl"
     tensor_parallel_size: int = 1
-    # Optional explicit DP size. When None, inferred as world_size // tensor_parallel_size.
+    pipeline_parallel_size: int = 1
+    num_microbatches: int = 1
+    # Optional explicit DP size. When None, inferred as world_size // (pp * tp).
     data_parallel_size: int | None = None
 
     @property
     def tokens_per_step_per_rank(self) -> int:
-        return self.batch_size * self.seq_len * self.grad_accum_steps
+        # batch_size is the microbatch size when PP is enabled.
+        microbatches = self.num_microbatches if self.pipeline_parallel_size > 1 else 1
+        return self.batch_size * self.seq_len * self.grad_accum_steps * microbatches

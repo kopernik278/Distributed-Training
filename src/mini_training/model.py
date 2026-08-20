@@ -10,8 +10,12 @@ from .config import TrainingConfig
 from .layers import ColumnParallelLinear, RowParallelLinear
 from .parallel_state import (
     ensure_divisible,
+    get_pipeline_model_parallel_rank,
+    get_pipeline_model_parallel_world_size,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    is_pipeline_first_stage,
+    is_pipeline_last_stage,
 )
 
 
@@ -147,6 +151,109 @@ class MiniTransformerLM(nn.Module):
             x = block(x, attn_mask=mask)
         x = self.final_norm(x)
         return self.lm_head(x)
+
+
+class PipelineStage(nn.Module):
+    """One pipeline stage: optional embed, a contiguous block range, optional LM head."""
+
+    def __init__(self, config: TrainingConfig) -> None:
+        super().__init__()
+        self.config = config
+        pp_size = get_pipeline_model_parallel_world_size()
+        pp_rank = get_pipeline_model_parallel_rank()
+        ensure_divisible(config.num_layers, pp_size, "num_layers")
+        tp_size = get_tensor_model_parallel_world_size()
+        ensure_divisible(config.hidden_size, tp_size, "hidden_size")
+        ensure_divisible(config.num_heads, tp_size, "num_heads")
+        ensure_divisible(config.hidden_size * config.mlp_ratio, tp_size, "mlp_hidden_size")
+
+        layers_per_stage = config.num_layers // pp_size
+        self.layer_start = pp_rank * layers_per_stage
+        self.layer_end = self.layer_start + layers_per_stage
+        self.is_first = is_pipeline_first_stage()
+        self.is_last = is_pipeline_last_stage()
+
+        if self.is_first:
+            self.token_embeddings = nn.Embedding(config.vocab_size, config.hidden_size)
+            self.position_embeddings = nn.Embedding(config.seq_len, config.hidden_size)
+            self.embed_dropout = nn.Dropout(config.dropout)
+        else:
+            self.token_embeddings = None
+            self.position_embeddings = None
+            self.embed_dropout = None
+
+        self.blocks = nn.ModuleList(
+            [
+                TransformerBlock(
+                    hidden_size=config.hidden_size,
+                    num_heads=config.num_heads,
+                    mlp_ratio=config.mlp_ratio,
+                    dropout=config.dropout,
+                )
+                for _ in range(layers_per_stage)
+            ]
+        )
+
+        if self.is_last:
+            self.final_norm = nn.LayerNorm(config.hidden_size)
+            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+            # Weight tying only when embed lives on this stage (pp_size == 1).
+            if self.is_first and self.token_embeddings is not None:
+                self.lm_head.weight = self.token_embeddings.weight
+        else:
+            self.final_norm = None
+            self.lm_head = None
+
+        self.register_buffer(
+            "causal_mask",
+            torch.triu(
+                torch.full((config.seq_len, config.seq_len), float("-inf")),
+                diagonal=1,
+            ),
+            persistent=False,
+        )
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module: nn.Module) -> None:
+        if isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, nn.Linear) and not hasattr(module.weight, "tensor_model_parallel"):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+
+    def forward(
+        self,
+        *,
+        input_ids: torch.Tensor | None = None,
+        hidden_states: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if self.is_first:
+            if input_ids is None:
+                raise ValueError("first pipeline stage requires input_ids")
+            batch_size, seq_len = input_ids.shape
+            positions = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
+            assert self.token_embeddings is not None
+            assert self.position_embeddings is not None
+            assert self.embed_dropout is not None
+            x = self.token_embeddings(input_ids) + self.position_embeddings(positions)
+            x = self.embed_dropout(x)
+        else:
+            if hidden_states is None:
+                raise ValueError("non-first pipeline stage requires hidden_states")
+            x = hidden_states
+            seq_len = x.size(1)
+
+        mask = self.causal_mask[:seq_len, :seq_len]
+        for block in self.blocks:
+            x = block(x, attn_mask=mask)
+
+        if self.is_last:
+            assert self.final_norm is not None
+            assert self.lm_head is not None
+            x = self.final_norm(x)
+            return self.lm_head(x)
+        return x
 
 
 def cross_entropy_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:

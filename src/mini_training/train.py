@@ -25,23 +25,28 @@ from .distributed import (
     reduce_mean,
     set_seed,
 )
-from .model import MiniTransformerLM, cross_entropy_loss, model_parameter_count
+from .model import MiniTransformerLM, PipelineStage, cross_entropy_loss, model_parameter_count
 from .parallel_state import (
     broadcast_parameters_within_dp,
     destroy_model_parallel,
     get_data_parallel_group,
     get_data_parallel_rank,
     get_data_parallel_world_size,
+    get_pipeline_model_parallel_group,
+    get_pipeline_model_parallel_last_rank,
+    get_pipeline_model_parallel_rank,
+    get_pipeline_model_parallel_world_size,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     initialize_model_parallel,
 )
+from .pipeline import MicrobatchIO, PipelineEngine
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Mini distributed training engine")
     parser.add_argument("--steps", type=int, default=20)
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--batch-size", type=int, default=8, help="Microbatch size when PP>1")
     parser.add_argument("--seq-len", type=int, default=256)
     parser.add_argument("--hidden-size", type=int, default=256)
     parser.add_argument("--num-layers", type=int, default=4)
@@ -56,11 +61,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--backend", type=str, default="nccl")
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
+    parser.add_argument("--pipeline-parallel-size", type=int, default=1)
+    parser.add_argument(
+        "--num-microbatches",
+        type=int,
+        default=None,
+        help="PP microbatches per step (default: max(pp_size, 1); ignored when pp=1)",
+    )
     parser.add_argument(
         "--data-parallel-size",
         type=int,
         default=None,
-        help="Optional. Must equal world_size // tensor_parallel_size when set.",
+        help="Optional. Must equal world_size // (pp * tp) when set.",
     )
     parser.add_argument("--log-interval", type=int, default=1)
     parser.add_argument("--metrics-path", type=str, default="")
@@ -69,6 +81,12 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_config(args: argparse.Namespace) -> TrainingConfig:
+    pp = args.pipeline_parallel_size
+    num_microbatches = args.num_microbatches
+    if num_microbatches is None:
+        num_microbatches = max(pp, 1)
+    if pp == 1:
+        num_microbatches = 1
     return TrainingConfig(
         steps=args.steps,
         batch_size=args.batch_size,
@@ -86,6 +104,8 @@ def build_config(args: argparse.Namespace) -> TrainingConfig:
         seed=args.seed,
         backend=args.backend,
         tensor_parallel_size=args.tensor_parallel_size,
+        pipeline_parallel_size=pp,
+        num_microbatches=num_microbatches,
         data_parallel_size=args.data_parallel_size,
         log_interval=args.log_interval,
     )
@@ -126,6 +146,8 @@ def collect_environment(device: torch.device, backend: str) -> dict[str, object]
         "local_rank": int(os.environ.get("LOCAL_RANK", 0)),
         "tensor_parallel_size": get_tensor_model_parallel_world_size(),
         "tensor_parallel_rank": get_tensor_model_parallel_rank(),
+        "pipeline_parallel_size": get_pipeline_model_parallel_world_size(),
+        "pipeline_parallel_rank": get_pipeline_model_parallel_rank(),
         "data_parallel_size": get_data_parallel_world_size(),
         "data_parallel_rank": get_data_parallel_rank(),
     }
@@ -162,18 +184,99 @@ def summarize_metrics(metrics: list[dict[str, float | int]], warmup_discard: int
 def validate_parallel_sizes(world_size: int, config: TrainingConfig) -> int:
     if config.tensor_parallel_size < 1:
         raise ValueError("tensor_parallel_size must be >= 1")
-    if world_size % config.tensor_parallel_size != 0:
+    if config.pipeline_parallel_size < 1:
+        raise ValueError("pipeline_parallel_size must be >= 1")
+    model_parallel = config.tensor_parallel_size * config.pipeline_parallel_size
+    if world_size % model_parallel != 0:
         raise ValueError(
-            f"world_size={world_size} must be divisible by tensor_parallel_size={config.tensor_parallel_size}"
+            f"world_size={world_size} must be divisible by tp*pp="
+            f"{config.tensor_parallel_size}*{config.pipeline_parallel_size}"
         )
-    inferred_dp = world_size // config.tensor_parallel_size
+    if config.pipeline_parallel_size > 1 and config.num_layers % config.pipeline_parallel_size != 0:
+        raise ValueError(
+            f"num_layers={config.num_layers} must be divisible by "
+            f"pipeline_parallel_size={config.pipeline_parallel_size}"
+        )
+    if config.pipeline_parallel_size > 1 and config.num_microbatches < 1:
+        raise ValueError("num_microbatches must be >= 1 when pipeline parallel is enabled")
+    inferred_dp = world_size // model_parallel
     if config.data_parallel_size is not None and config.data_parallel_size != inferred_dp:
         raise ValueError(
             f"data_parallel_size={config.data_parallel_size} conflicts with "
-            f"world_size={world_size} / tensor_parallel_size={config.tensor_parallel_size} "
-            f"(inferred dp={inferred_dp})"
+            f"world_size={world_size} / (pp*tp) (inferred dp={inferred_dp})"
         )
     return inferred_dp
+
+
+def _wrap_ddp(model: torch.nn.Module, device: torch.device) -> torch.nn.Module:
+    if not (is_distributed() and get_data_parallel_world_size() > 1):
+        return model
+    ddp_kwargs = {
+        "device_ids": [device.index] if device.type == "cuda" else None,
+        "process_group": get_data_parallel_group(),
+    }
+    if ddp_kwargs["device_ids"] is None:
+        ddp_kwargs.pop("device_ids")
+    return DDP(model, **ddp_kwargs)
+
+
+def _run_non_pipeline_step(
+    model: torch.nn.Module,
+    dataset: RandomTokenDataset,
+    config: TrainingConfig,
+    device: torch.device,
+) -> tuple[float, float, float]:
+    forward_s = 0.0
+    backward_s = 0.0
+    loss_value = 0.0
+    for _micro_step in range(config.grad_accum_steps):
+        inputs, targets = dataset.next_batch()
+        with Timer(device) as forward_timer:
+            logits = model(inputs)
+            loss = cross_entropy_loss(logits, targets) / config.grad_accum_steps
+        forward_s += forward_timer.elapsed_s
+        with Timer(device) as backward_timer:
+            loss.backward()
+        backward_s += backward_timer.elapsed_s
+        loss_value += loss.item()
+    return loss_value, forward_s, backward_s
+
+
+def _run_pipeline_step(
+    engine: PipelineEngine,
+    dataset: RandomTokenDataset,
+    config: TrainingConfig,
+    device: torch.device,
+) -> tuple[float, float, float]:
+    """One optimizer step of 1F1B. Timing is coarse (whole schedule)."""
+    forward_s = 0.0
+    backward_s = 0.0
+    loss_value = 0.0
+    for _accum in range(config.grad_accum_steps):
+        microbatches: list[MicrobatchIO] = []
+        for _ in range(config.num_microbatches):
+            inputs, targets = dataset.next_batch()
+            microbatches.append(MicrobatchIO(input_ids=inputs, targets=targets))
+        with Timer(device) as pipe_timer:
+            step_loss = engine.run(microbatches, device)
+        # Attribute whole schedule time to forward bucket for simplicity; PP mixes F/B.
+        forward_s += pipe_timer.elapsed_s
+        loss_value += step_loss / config.grad_accum_steps
+    return loss_value, forward_s, backward_s
+
+
+def _sync_pipeline_loss(loss_value: float, device: torch.device) -> float:
+    """Broadcast loss from last PP stage so all ranks share the same scalar for logging."""
+    tensor = torch.tensor([loss_value], device=device, dtype=torch.float64)
+    if is_distributed() and get_pipeline_model_parallel_world_size() > 1:
+        import torch.distributed as dist
+
+        dist.broadcast(
+            tensor,
+            src=get_pipeline_model_parallel_last_rank(),
+            group=get_pipeline_model_parallel_group(),
+        )
+    return float(tensor.item())
 
 
 def main() -> None:
@@ -182,39 +285,49 @@ def main() -> None:
     device, world_size, actual_backend = init_distributed(config.backend)
     inferred_dp = validate_parallel_sizes(world_size, config)
 
-    initialize_model_parallel(config.tensor_parallel_size)
+    initialize_model_parallel(
+        tensor_model_parallel_size=config.tensor_parallel_size,
+        pipeline_model_parallel_size=config.pipeline_parallel_size,
+    )
     if get_data_parallel_world_size() != inferred_dp:
         raise RuntimeError(
             f"parallel_state dp_size={get_data_parallel_world_size()} != inferred {inferred_dp}"
         )
 
     # Matching TP shards across DP replicas must share init; TP ranks differ.
-    set_seed(config.seed + get_tensor_model_parallel_rank())
-    model = MiniTransformerLM(config).to(device)
+    # PP stages own different layers, so also offset by pp_rank.
+    set_seed(config.seed + get_tensor_model_parallel_rank() + 1_000 * get_pipeline_model_parallel_rank())
+    use_pipeline = config.pipeline_parallel_size > 1
+    if use_pipeline:
+        model: torch.nn.Module = PipelineStage(config).to(device)
+    else:
+        model = MiniTransformerLM(config).to(device)
     broadcast_parameters_within_dp(model)
     parameter_count = model_parameter_count(model)
-
-    # DDP only across data-parallel replicas. When tp_size == world_size, dp_size=1.
-    if is_distributed() and get_data_parallel_world_size() > 1:
-        ddp_kwargs = {
-            "device_ids": [device.index] if device.type == "cuda" else None,
-            "process_group": get_data_parallel_group(),
-        }
-        if ddp_kwargs["device_ids"] is None:
-            ddp_kwargs.pop("device_ids")
-        model = DDP(model, **ddp_kwargs)
+    model = _wrap_ddp(model, device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
-    # TP peers (same dp_rank) share microbatches; different DP ranks diverge.
+    # All PP ranks in a DP replica share the same microbatch stream (first uses
+    # tokens, last uses targets; shapes must match for P2P).
     dataset = RandomTokenDataset(
         config,
         device,
         seed=config.seed + 10_000 + get_data_parallel_rank(),
     )
-    # Dropout / other global RNG should also match within a DP replica (across TP).
     set_seed(config.seed + 20_000 + get_data_parallel_rank())
-    environment = collect_environment(device, actual_backend)
 
+    engine: PipelineEngine | None = None
+    if use_pipeline:
+        # Keep DDP wrapper when present so DP gradient hooks still run.
+        param = next(model.parameters())
+        engine = PipelineEngine(
+            model,
+            num_microbatches=config.num_microbatches,
+            hidden_size=config.hidden_size,
+            dtype=param.dtype,
+        )
+
+    environment = collect_environment(device, actual_backend)
     metrics: list[dict[str, float | int]] = []
     barrier()
 
@@ -236,23 +349,12 @@ def main() -> None:
     for step in range(config.steps):
         optimizer.zero_grad(set_to_none=True)
 
-        forward_s = 0.0
-        backward_s = 0.0
-        loss_value = 0.0
-
         with Timer(device) as step_timer:
-            for _micro_step in range(config.grad_accum_steps):
-                inputs, targets = dataset.next_batch()
-
-                with Timer(device) as forward_timer:
-                    logits = model(inputs)
-                    loss = cross_entropy_loss(logits, targets) / config.grad_accum_steps
-                forward_s += forward_timer.elapsed_s
-
-                with Timer(device) as backward_timer:
-                    loss.backward()
-                backward_s += backward_timer.elapsed_s
-                loss_value += loss.item()
+            if engine is not None:
+                loss_value, forward_s, backward_s = _run_pipeline_step(engine, dataset, config, device)
+                loss_value = _sync_pipeline_loss(loss_value, device)
+            else:
+                loss_value, forward_s, backward_s = _run_non_pipeline_step(model, dataset, config, device)
 
             lr = linear_warmup_lr(step, config)
             for param_group in optimizer.param_groups:
@@ -263,9 +365,7 @@ def main() -> None:
             optimizer_s = optimizer_timer.elapsed_s
 
         step_time_s = step_timer.elapsed_s
-        # For pure TP, every rank sees the same batch tokens; do not multiply by tp_size.
-        # For DP, each DP replica processes distinct tokens.
-        local_tokens = config.batch_size * config.seq_len * config.grad_accum_steps
+        local_tokens = config.tokens_per_step_per_rank
         global_tokens = float(local_tokens * get_data_parallel_world_size())
         avg_loss = reduce_mean(loss_value, device)
         avg_step_time_s = reduce_mean(step_time_s, device)
@@ -280,7 +380,9 @@ def main() -> None:
             "rank": get_rank(),
             "world_size": get_world_size(),
             "tensor_parallel_size": get_tensor_model_parallel_world_size(),
+            "pipeline_parallel_size": get_pipeline_model_parallel_world_size(),
             "data_parallel_size": get_data_parallel_world_size(),
+            "num_microbatches": config.num_microbatches if use_pipeline else 1,
             "loss": avg_loss,
             "lr": lr,
             "step_time_ms": avg_step_time_s * 1000.0,

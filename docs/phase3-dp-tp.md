@@ -48,6 +48,6 @@ BACKEND=nccl ./scripts/run_dp_tp.sh 2 2 --steps 20 --batch-size 8 --seq-len 256 
 
 ## Next
 
-- Pipeline Parallel + 1F1B
+- See Phase 4: `docs/phase4-pipeline-parallel.md` (Pipeline + 1F1B)
 - Distributed Checkpoint
 - Profiling / overlap
