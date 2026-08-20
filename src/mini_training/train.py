@@ -23,13 +23,14 @@ from .distributed import (
     is_distributed,
     is_main_process,
     reduce_mean,
-    reduce_sum,
     set_seed,
 )
 from .model import MiniTransformerLM, cross_entropy_loss, model_parameter_count
 from .parallel_state import (
+    broadcast_parameters_within_dp,
     destroy_model_parallel,
     get_data_parallel_group,
+    get_data_parallel_rank,
     get_data_parallel_world_size,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -55,6 +56,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--backend", type=str, default="nccl")
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
+    parser.add_argument(
+        "--data-parallel-size",
+        type=int,
+        default=None,
+        help="Optional. Must equal world_size // tensor_parallel_size when set.",
+    )
     parser.add_argument("--log-interval", type=int, default=1)
     parser.add_argument("--metrics-path", type=str, default="")
     parser.add_argument("--warmup-discard", type=int, default=1, help="Drop first N steps from summary averages")
@@ -79,6 +86,7 @@ def build_config(args: argparse.Namespace) -> TrainingConfig:
         seed=args.seed,
         backend=args.backend,
         tensor_parallel_size=args.tensor_parallel_size,
+        data_parallel_size=args.data_parallel_size,
         log_interval=args.log_interval,
     )
 
@@ -119,6 +127,7 @@ def collect_environment(device: torch.device, backend: str) -> dict[str, object]
         "tensor_parallel_size": get_tensor_model_parallel_world_size(),
         "tensor_parallel_rank": get_tensor_model_parallel_rank(),
         "data_parallel_size": get_data_parallel_world_size(),
+        "data_parallel_rank": get_data_parallel_rank(),
     }
     if torch.cuda.is_available():
         env["cuda_version"] = torch.version.cuda
@@ -150,19 +159,39 @@ def summarize_metrics(metrics: list[dict[str, float | int]], warmup_discard: int
     }
 
 
-def main() -> None:
-    args = parse_args()
-    config = build_config(args)
-    device, world_size, actual_backend = init_distributed(config.backend)
+def validate_parallel_sizes(world_size: int, config: TrainingConfig) -> int:
+    if config.tensor_parallel_size < 1:
+        raise ValueError("tensor_parallel_size must be >= 1")
     if world_size % config.tensor_parallel_size != 0:
         raise ValueError(
             f"world_size={world_size} must be divisible by tensor_parallel_size={config.tensor_parallel_size}"
         )
+    inferred_dp = world_size // config.tensor_parallel_size
+    if config.data_parallel_size is not None and config.data_parallel_size != inferred_dp:
+        raise ValueError(
+            f"data_parallel_size={config.data_parallel_size} conflicts with "
+            f"world_size={world_size} / tensor_parallel_size={config.tensor_parallel_size} "
+            f"(inferred dp={inferred_dp})"
+        )
+    return inferred_dp
+
+
+def main() -> None:
+    args = parse_args()
+    config = build_config(args)
+    device, world_size, actual_backend = init_distributed(config.backend)
+    inferred_dp = validate_parallel_sizes(world_size, config)
 
     initialize_model_parallel(config.tensor_parallel_size)
-    set_seed(config.seed)
+    if get_data_parallel_world_size() != inferred_dp:
+        raise RuntimeError(
+            f"parallel_state dp_size={get_data_parallel_world_size()} != inferred {inferred_dp}"
+        )
 
+    # Matching TP shards across DP replicas must share init; TP ranks differ.
+    set_seed(config.seed + get_tensor_model_parallel_rank())
     model = MiniTransformerLM(config).to(device)
+    broadcast_parameters_within_dp(model)
     parameter_count = model_parameter_count(model)
 
     # DDP only across data-parallel replicas. When tp_size == world_size, dp_size=1.
@@ -176,7 +205,14 @@ def main() -> None:
         model = DDP(model, **ddp_kwargs)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
-    dataset = RandomTokenDataset(config, device)
+    # TP peers (same dp_rank) share microbatches; different DP ranks diverge.
+    dataset = RandomTokenDataset(
+        config,
+        device,
+        seed=config.seed + 10_000 + get_data_parallel_rank(),
+    )
+    # Dropout / other global RNG should also match within a DP replica (across TP).
+    set_seed(config.seed + 20_000 + get_data_parallel_rank())
     environment = collect_environment(device, actual_backend)
 
     metrics: list[dict[str, float | int]] = []

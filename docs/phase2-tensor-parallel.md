@@ -50,7 +50,6 @@ That is why we added a multiprocess test comparing sharded Column+Row MLP agains
 
 ## Next
 
-- DP×TP combined runs
+- See Phase 3: `docs/phase3-dp-tp.md` (DP×TP)
 - Sequence Parallel
 - Vocab Parallel LM head
-- RunPod TP vs DDP benchmark table

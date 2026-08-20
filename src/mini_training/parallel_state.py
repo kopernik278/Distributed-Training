@@ -123,6 +123,23 @@ def initialize_model_parallel(tensor_model_parallel_size: int = 1) -> None:
     _MODEL_PARALLEL_IS_INITIALIZED = True
 
 
+def get_data_parallel_src_rank() -> int:
+    """Global rank of the DP-group leader (dp_rank == 0) for this TP shard."""
+    return _TENSOR_MODEL_PARALLEL_RANK
+
+
+def broadcast_parameters_within_dp(module: torch.nn.Module) -> None:
+    """Broadcast parameters from dp_rank=0 so matching TP shards stay identical across DP."""
+    if not dist.is_initialized() or _DATA_PARALLEL_SIZE <= 1:
+        return
+    group = _DATA_PARALLEL_GROUP
+    src = get_data_parallel_src_rank()
+    for param in module.parameters():
+        dist.broadcast(param.data, src=src, group=group)
+    for buffer in module.buffers():
+        dist.broadcast(buffer.data, src=src, group=group)
+
+
 def ensure_divisible(value: int, divisor: int, name: str) -> None:
     if value % divisor != 0:
         raise ValueError(f"{name}={value} must be divisible by tensor_parallel_size={divisor}")

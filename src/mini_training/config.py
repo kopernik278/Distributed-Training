@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
 
 
@@ -20,6 +22,8 @@ class TrainingConfig:
     log_interval: int = 1
     backend: str = "nccl"
     tensor_parallel_size: int = 1
+    # Optional explicit DP size. When None, inferred as world_size // tensor_parallel_size.
+    data_parallel_size: int | None = None
 
     @property
     def tokens_per_step_per_rank(self) -> int:

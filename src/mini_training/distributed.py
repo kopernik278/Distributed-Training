@@ -60,11 +60,11 @@ def cleanup_distributed() -> None:
 
 
 def set_seed(seed: int) -> None:
-    rank = get_rank()
-    random.seed(seed + rank)
-    torch.manual_seed(seed + rank)
+    """Set Python/Torch RNG to an absolute seed (caller chooses DP/TP offsets)."""
+    random.seed(seed)
+    torch.manual_seed(seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed + rank)
+        torch.cuda.manual_seed_all(seed)
 
 
 def barrier() -> None:
