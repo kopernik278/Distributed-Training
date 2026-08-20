@@ -15,106 +15,83 @@ Cursor  +  GitHub  +  RunPod
 - **GitHub**: source of truth and reproducible commit history
 - **RunPod**: real GPU / multi-GPU / NCCL execution and profiling
 
-Workflow docs:
-
-- [`docs/ops/cursor-github-runpod-workflow.md`](./docs/ops/cursor-github-runpod-workflow.md)
-- [`docs/ops/runpod-setup-guide.md`](./docs/ops/runpod-setup-guide.md)
-- [`docs/ops/enterprise-stack.md`](./docs/ops/enterprise-stack.md)
-
 ## Current milestone
 
-**Project 1 / Phase 1 (Stage 1-2): DDP baseline**
+**Project 1 / Phase 2: Tensor Parallelism (on top of Phase 1 DDP baseline)**
 
-- minimal Transformer language model
-- synthetic next-token workload
-- PyTorch DDP training loop
-- forward / backward / optimizer timing breakdown
-- correctness tests
-- DDP scaling benchmark script
-- RunPod GPU launch scripts
-- RFC + experiment documentation
+Completed:
+
+- Phase 1 DDP baseline + real 2x RTX 4090 NCCL measurements
+- Phase 2 Megatron-style `ColumnParallelLinear` / `RowParallelLinear`
+- TP process groups, autograd collectives, attention+MLP TP wiring
+- multiprocess numerical correctness tests
 
 ## Repository layout
 
 ```text
-AI_INFRA_CONTEXT.md
-configs/
-  phase1_gpu_smoke.yaml
 src/mini_training/
+  config.py
+  data.py
+  distributed.py
+  parallel_state.py
+  mappings.py
+  layers.py
+  model.py
+  train.py
 scripts/
-  run_single_node_ddp.sh
+  run_tp.sh
   benchmark_ddp_scaling.sh
   runpod/
-    bootstrap.sh
-    check_gpu_env.sh
-    run_ddp_gpu.sh
-    run_ddp_multinode.sh
-tests/
 docs/
-  design/
+  design/RFC-001-phase1-ddp-baseline.md
+  design/RFC-002-tensor-parallel-linear.md
+  phase2-tensor-parallel.md
   experiments/
-  ops/
-requirements/
-  gpu.txt
 ```
 
-## Install (CPU / Cursor machine)
+## Install
 
 ```bash
 python3 -m pip install -e .
 ```
 
-CPU smoke:
+## Tests
 
 ```bash
-python3 -m mini_training.train --steps 5 --batch-size 2 --seq-len 64
 python3 -m unittest discover -s tests -v
 ```
 
-## Run on RunPod (GPU)
+## Run
 
-Follow [`docs/ops/runpod-setup-guide.md`](./docs/ops/runpod-setup-guide.md), then:
+### Phase 1 style DDP
+
+```bash
+NPROC_PER_NODE=2 ./scripts/run_single_node_ddp.sh --steps 10 --batch-size 4 --seq-len 128
+```
+
+### Phase 2 Tensor Parallel
+
+```bash
+./scripts/run_tp.sh 1 --steps 5 --batch-size 2 --seq-len 64
+./scripts/run_tp.sh 2 --steps 5 --batch-size 2 --seq-len 64 --hidden-size 64 --num-heads 8
+```
+
+### RunPod GPU
 
 ```bash
 ./scripts/runpod/bootstrap.sh
 ./scripts/runpod/check_gpu_env.sh
-./scripts/runpod/run_ddp_gpu.sh 1
-./scripts/runpod/run_ddp_gpu.sh 2
+BACKEND=nccl ./scripts/run_tp.sh 2 --steps 20 --batch-size 8 --seq-len 256 \
+  --hidden-size 256 --num-layers 4 --num-heads 8 --metrics-path results/tp2.json
 ```
-
-Scaling benchmark on GPU:
-
-```bash
-WORLD_SIZES=1,2 BACKEND=nccl STEPS=20 \
-OUT_DIR=results/phase1_runpod_gpu \
-./scripts/benchmark_ddp_scaling.sh
-```
-
-## Metrics
-
-Each step logs:
-
-- `loss`
-- `step_time_ms`
-- `forward_ms`
-- `backward_ms`
-- `optimizer_ms`
-- `rank_tokens_per_second`
-- `global_tokens_per_second`
-
-Metrics files also include environment metadata (device, backend, commit, GPU name when available).
 
 ## Important rule
 
-Never report fabricated performance numbers.
+Never report fabricated performance numbers. CPU/Gloo is for correctness; RunPod CUDA/NCCL is for portfolio measurements.
 
-- CPU/Gloo results: instrumentation only
-- RunPod CUDA/NCCL results: valid portfolio measurements (with hardware metadata)
+## Next stages
 
-## Next stages (Project 1)
-
-1. RunPod single-node NCCL DDP baseline table
-2. Tensor Parallel Linear (`ColumnParallel` / `RowParallel`)
-3. Pipeline Parallel + 1F1B
-4. Distributed Checkpoint save/resume/reshard
-5. Profiling hooks and communication/computation overlap
+1. DP × TP combined experiments on RunPod
+2. Pipeline Parallel + 1F1B
+3. Distributed Checkpoint save/resume/reshard
+4. Profiling hooks and communication/computation overlap
