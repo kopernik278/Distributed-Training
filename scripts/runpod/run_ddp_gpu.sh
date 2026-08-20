@@ -12,8 +12,9 @@ cd "${ROOT_DIR}"
 
 PYTHON_BIN="${PYTHON_BIN:-}"
 if [[ -z "${PYTHON_BIN}" ]]; then
-  if [[ -x "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/.venv/bin/python" ]]; then
-    PYTHON_BIN="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/.venv/bin/python"
+  CANDIDATE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/.venv/bin/python"
+  if [[ -x "${CANDIDATE}" ]] && "${CANDIDATE}" -c "import torch, mini_training" >/dev/null 2>&1; then
+    PYTHON_BIN="${CANDIDATE}"
   else
     PYTHON_BIN=python3
   fi

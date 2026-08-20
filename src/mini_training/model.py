@@ -4,37 +4,89 @@ import math
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 from .config import TrainingConfig
+from .layers import ColumnParallelLinear, RowParallelLinear
+from .parallel_state import (
+    ensure_divisible,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
+
+
+class TensorParallelAttention(nn.Module):
+    def __init__(self, hidden_size: int, num_heads: int, dropout: float) -> None:
+        super().__init__()
+        tp_size = get_tensor_model_parallel_world_size()
+        ensure_divisible(hidden_size, tp_size, "hidden_size")
+        ensure_divisible(num_heads, tp_size, "num_heads")
+
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.num_heads_per_partition = num_heads // tp_size
+        self.head_dim = hidden_size // num_heads
+        self.hidden_size_per_partition = self.num_heads_per_partition * self.head_dim
+
+        self.qkv = ColumnParallelLinear(
+            hidden_size,
+            3 * hidden_size,
+            bias=True,
+            gather_output=False,
+        )
+        self.out_proj = RowParallelLinear(
+            hidden_size,
+            hidden_size,
+            bias=True,
+            input_is_parallel=True,
+        )
+        self.attn_dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len, _ = x.shape
+        qkv = self.qkv(x)
+        qkv = qkv.view(batch_size, seq_len, 3, self.num_heads_per_partition, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        query, key, value = qkv[0], qkv[1], qkv[2]
+
+        attn_scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        attn_scores = attn_scores + attn_mask
+        attn_probs = torch.softmax(attn_scores, dim=-1)
+        attn_probs = self.attn_dropout(attn_probs)
+        context = torch.matmul(attn_probs, value)
+        context = context.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_size_per_partition)
+        return self.out_proj(context)
+
+
+class TensorParallelMLP(nn.Module):
+    def __init__(self, hidden_size: int, mlp_ratio: int, dropout: float) -> None:
+        super().__init__()
+        tp_size = get_tensor_model_parallel_world_size()
+        ff_size = hidden_size * mlp_ratio
+        ensure_divisible(ff_size, tp_size, "mlp_hidden_size")
+
+        self.fc1 = ColumnParallelLinear(hidden_size, ff_size, bias=True, gather_output=False)
+        self.fc2 = RowParallelLinear(ff_size, hidden_size, bias=True, input_is_parallel=True)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.fc1(x)
+        x = F.gelu(x)
+        x = self.fc2(x)
+        return self.dropout(x)
 
 
 class TransformerBlock(nn.Module):
     def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: int, dropout: float) -> None:
         super().__init__()
         self.ln1 = nn.LayerNorm(hidden_size)
-        self.attn = nn.MultiheadAttention(
-            embed_dim=hidden_size,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
+        self.attn = TensorParallelAttention(hidden_size, num_heads, dropout)
         self.ln2 = nn.LayerNorm(hidden_size)
-        self.mlp = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size * mlp_ratio),
-            nn.GELU(),
-            nn.Linear(hidden_size * mlp_ratio, hidden_size),
-            nn.Dropout(dropout),
-        )
+        self.mlp = TensorParallelMLP(hidden_size, mlp_ratio, dropout)
 
     def forward(self, x: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
-        residual = x
-        x = self.ln1(x)
-        attn_output, _ = self.attn(x, x, x, attn_mask=attn_mask, need_weights=False)
-        x = residual + attn_output
-
-        residual = x
-        x = self.ln2(x)
-        x = residual + self.mlp(x)
+        x = x + self.attn(self.ln1(x), attn_mask)
+        x = x + self.mlp(self.ln2(x))
         return x
 
 
@@ -42,6 +94,11 @@ class MiniTransformerLM(nn.Module):
     def __init__(self, config: TrainingConfig) -> None:
         super().__init__()
         self.config = config
+        tp_size = get_tensor_model_parallel_world_size()
+        ensure_divisible(config.hidden_size, tp_size, "hidden_size")
+        ensure_divisible(config.num_heads, tp_size, "num_heads")
+        ensure_divisible(config.hidden_size * config.mlp_ratio, tp_size, "mlp_hidden_size")
+
         self.token_embeddings = nn.Embedding(config.vocab_size, config.hidden_size)
         self.position_embeddings = nn.Embedding(config.seq_len, config.hidden_size)
         self.dropout = nn.Dropout(config.dropout)
@@ -57,6 +114,7 @@ class MiniTransformerLM(nn.Module):
             ]
         )
         self.final_norm = nn.LayerNorm(config.hidden_size)
+        # Keep LM head replicated in this milestone for simpler correctness/testing.
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.lm_head.weight = self.token_embeddings.weight
 
@@ -71,9 +129,11 @@ class MiniTransformerLM(nn.Module):
         self.apply(self._init_weights)
 
     def _init_weights(self, module: nn.Module) -> None:
-        if isinstance(module, (nn.Linear, nn.Embedding)):
+        if isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if isinstance(module, nn.Linear) and module.bias is not None:
+        elif isinstance(module, nn.Linear) and not hasattr(module.weight, "tensor_model_parallel"):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
                 nn.init.zeros_(module.bias)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -95,4 +155,29 @@ def cross_entropy_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Ten
 
 
 def model_parameter_count(model: nn.Module) -> int:
+    # Local parameter count on this rank (sharded params counted locally).
     return sum(math.prod(param.shape) for param in model.parameters())
+
+
+def load_tp_shards_from_full_linear(
+    full: nn.Linear,
+    column: ColumnParallelLinear | None = None,
+    row: RowParallelLinear | None = None,
+) -> None:
+    """Helper used by tests to copy dense weights into TP shards."""
+    from .layers import shard_column_weight, shard_row_weight
+
+    tp_rank = get_tensor_model_parallel_rank()
+    tp_size = get_tensor_model_parallel_world_size()
+    with torch.no_grad():
+        if column is not None:
+            column.weight.copy_(shard_column_weight(full.weight.data, tp_rank, tp_size))
+            if column.bias is not None and full.bias is not None:
+                out = full.bias.numel()
+                local = out // tp_size
+                start = tp_rank * local
+                column.bias.copy_(full.bias.data[start : start + local])
+        if row is not None:
+            row.weight.copy_(shard_row_weight(full.weight.data, tp_rank, tp_size))
+            if row.bias is not None and full.bias is not None:
+                row.bias.copy_(full.bias.data)

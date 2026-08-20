@@ -9,7 +9,7 @@ cd "${ROOT_DIR}"
 
 PYTHON_BIN="${PYTHON_BIN:-}"
 if [[ -z "${PYTHON_BIN}" ]]; then
-  if [[ -x "${ROOT_DIR}/.venv/bin/python" ]]; then
+  if [[ -x "${ROOT_DIR}/.venv/bin/python" ]] && "${ROOT_DIR}/.venv/bin/python" -c "import torch, mini_training" >/dev/null 2>&1; then
     PYTHON_BIN="${ROOT_DIR}/.venv/bin/python"
   else
     PYTHON_BIN=python3

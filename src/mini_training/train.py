@@ -27,10 +27,18 @@ from .distributed import (
     set_seed,
 )
 from .model import MiniTransformerLM, cross_entropy_loss, model_parameter_count
+from .parallel_state import (
+    destroy_model_parallel,
+    get_data_parallel_group,
+    get_data_parallel_world_size,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    initialize_model_parallel,
+)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Phase 1 DDP training baseline")
+    parser = argparse.ArgumentParser(description="Mini distributed training engine")
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--seq-len", type=int, default=256)
@@ -46,6 +54,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--backend", type=str, default="nccl")
+    parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--log-interval", type=int, default=1)
     parser.add_argument("--metrics-path", type=str, default="")
     parser.add_argument("--warmup-discard", type=int, default=1, help="Drop first N steps from summary averages")
@@ -69,6 +78,7 @@ def build_config(args: argparse.Namespace) -> TrainingConfig:
         grad_accum_steps=args.grad_accum_steps,
         seed=args.seed,
         backend=args.backend,
+        tensor_parallel_size=args.tensor_parallel_size,
         log_interval=args.log_interval,
     )
 
@@ -106,6 +116,9 @@ def collect_environment(device: torch.device, backend: str) -> dict[str, object]
         "world_size": get_world_size(),
         "rank": get_rank(),
         "local_rank": int(os.environ.get("LOCAL_RANK", 0)),
+        "tensor_parallel_size": get_tensor_model_parallel_world_size(),
+        "tensor_parallel_rank": get_tensor_model_parallel_rank(),
+        "data_parallel_size": get_data_parallel_world_size(),
     }
     if torch.cuda.is_available():
         env["cuda_version"] = torch.version.cuda
@@ -140,13 +153,26 @@ def summarize_metrics(metrics: list[dict[str, float | int]], warmup_discard: int
 def main() -> None:
     args = parse_args()
     config = build_config(args)
-    device, _, actual_backend = init_distributed(config.backend)
+    device, world_size, actual_backend = init_distributed(config.backend)
+    if world_size % config.tensor_parallel_size != 0:
+        raise ValueError(
+            f"world_size={world_size} must be divisible by tensor_parallel_size={config.tensor_parallel_size}"
+        )
+
+    initialize_model_parallel(config.tensor_parallel_size)
     set_seed(config.seed)
 
     model = MiniTransformerLM(config).to(device)
     parameter_count = model_parameter_count(model)
-    if is_distributed():
-        ddp_kwargs = {"device_ids": [device.index]} if device.type == "cuda" else {}
+
+    # DDP only across data-parallel replicas. When tp_size == world_size, dp_size=1.
+    if is_distributed() and get_data_parallel_world_size() > 1:
+        ddp_kwargs = {
+            "device_ids": [device.index] if device.type == "cuda" else None,
+            "process_group": get_data_parallel_group(),
+        }
+        if ddp_kwargs["device_ids"] is None:
+            ddp_kwargs.pop("device_ids")
         model = DDP(model, **ddp_kwargs)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
@@ -201,8 +227,10 @@ def main() -> None:
             optimizer_s = optimizer_timer.elapsed_s
 
         step_time_s = step_timer.elapsed_s
+        # For pure TP, every rank sees the same batch tokens; do not multiply by tp_size.
+        # For DP, each DP replica processes distinct tokens.
         local_tokens = config.batch_size * config.seq_len * config.grad_accum_steps
-        global_tokens = reduce_sum(float(local_tokens), device)
+        global_tokens = float(local_tokens * get_data_parallel_world_size())
         avg_loss = reduce_mean(loss_value, device)
         avg_step_time_s = reduce_mean(step_time_s, device)
         avg_forward_s = reduce_mean(forward_s, device)
@@ -215,6 +243,8 @@ def main() -> None:
             "step": step,
             "rank": get_rank(),
             "world_size": get_world_size(),
+            "tensor_parallel_size": get_tensor_model_parallel_world_size(),
+            "data_parallel_size": get_data_parallel_world_size(),
             "loss": avg_loss,
             "lr": lr,
             "step_time_ms": avg_step_time_s * 1000.0,
@@ -249,6 +279,7 @@ def main() -> None:
                 indent=2,
             )
 
+    destroy_model_parallel()
     cleanup_distributed()
 
 

@@ -19,6 +19,7 @@ class TrainingConfig:
     seed: int = 42
     log_interval: int = 1
     backend: str = "nccl"
+    tensor_parallel_size: int = 1
 
     @property
     def tokens_per_step_per_rank(self) -> int:
