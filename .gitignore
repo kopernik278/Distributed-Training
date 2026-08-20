@@ -4,3 +4,5 @@ __pycache__/
 *.egg-info/
 single_metrics.json
 ddp_metrics.json
+results/
+profiles/

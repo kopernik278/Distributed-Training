@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import platform
+import subprocess
 from dataclasses import asdict
+from datetime import datetime, timezone
 
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -44,6 +48,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backend", type=str, default="nccl")
     parser.add_argument("--log-interval", type=int, default=1)
     parser.add_argument("--metrics-path", type=str, default="")
+    parser.add_argument("--warmup-discard", type=int, default=1, help="Drop first N steps from summary averages")
     return parser.parse_args()
 
 
@@ -75,6 +80,63 @@ def linear_warmup_lr(step: int, config: TrainingConfig) -> float:
     return config.lr * scale
 
 
+def git_commit_hash() -> str:
+    try:
+        return (
+            subprocess.check_output(
+                ["git", "rev-parse", "--short", "HEAD"],
+                stderr=subprocess.DEVNULL,
+                text=True,
+            ).strip()
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return "unknown"
+
+
+def collect_environment(device: torch.device, backend: str) -> dict[str, object]:
+    env: dict[str, object] = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "commit": git_commit_hash(),
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "pytorch": torch.__version__,
+        "cuda_available": torch.cuda.is_available(),
+        "device": str(device),
+        "backend": backend,
+        "world_size": get_world_size(),
+        "rank": get_rank(),
+        "local_rank": int(os.environ.get("LOCAL_RANK", 0)),
+    }
+    if torch.cuda.is_available():
+        env["cuda_version"] = torch.version.cuda
+        env["gpu_name"] = torch.cuda.get_device_name(device)
+        env["gpu_count"] = torch.cuda.device_count()
+        if hasattr(torch.cuda, "nccl") and hasattr(torch.cuda.nccl, "version"):
+            env["nccl_version"] = ".".join(str(part) for part in torch.cuda.nccl.version())
+    return env
+
+
+def summarize_metrics(metrics: list[dict[str, float | int]], warmup_discard: int) -> dict[str, float | int]:
+    usable = metrics[warmup_discard:] if len(metrics) > warmup_discard else metrics
+    if not usable:
+        return {"num_steps": 0}
+
+    def mean(key: str) -> float:
+        return sum(float(item[key]) for item in usable) / len(usable)
+
+    return {
+        "num_steps": len(usable),
+        "warmup_discard": warmup_discard,
+        "avg_loss": mean("loss"),
+        "avg_step_time_ms": mean("step_time_ms"),
+        "avg_forward_ms": mean("forward_ms"),
+        "avg_backward_ms": mean("backward_ms"),
+        "avg_optimizer_ms": mean("optimizer_ms"),
+        "avg_rank_tokens_per_second": mean("rank_tokens_per_second"),
+        "avg_global_tokens_per_second": mean("global_tokens_per_second"),
+    }
+
+
 def main() -> None:
     args = parse_args()
     config = build_config(args)
@@ -89,6 +151,7 @@ def main() -> None:
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
     dataset = RandomTokenDataset(config, device)
+    environment = collect_environment(device, actual_backend)
 
     metrics: list[dict[str, float | int]] = []
     barrier()
@@ -103,6 +166,7 @@ def main() -> None:
                     "backend": actual_backend,
                     "config": asdict(config),
                     "parameter_count": parameter_count,
+                    "environment": environment,
                 }
             )
         )
@@ -110,25 +174,40 @@ def main() -> None:
     for step in range(config.steps):
         optimizer.zero_grad(set_to_none=True)
 
-        with Timer(device) as timer:
-            loss_value = 0.0
-            for micro_step in range(config.grad_accum_steps):
+        forward_s = 0.0
+        backward_s = 0.0
+        loss_value = 0.0
+
+        with Timer(device) as step_timer:
+            for _micro_step in range(config.grad_accum_steps):
                 inputs, targets = dataset.next_batch()
-                logits = model(inputs)
-                loss = cross_entropy_loss(logits, targets) / config.grad_accum_steps
-                loss.backward()
+
+                with Timer(device) as forward_timer:
+                    logits = model(inputs)
+                    loss = cross_entropy_loss(logits, targets) / config.grad_accum_steps
+                forward_s += forward_timer.elapsed_s
+
+                with Timer(device) as backward_timer:
+                    loss.backward()
+                backward_s += backward_timer.elapsed_s
                 loss_value += loss.item()
 
             lr = linear_warmup_lr(step, config)
             for param_group in optimizer.param_groups:
                 param_group["lr"] = lr
-            optimizer.step()
 
-        step_time_s = timer.elapsed_s
+            with Timer(device) as optimizer_timer:
+                optimizer.step()
+            optimizer_s = optimizer_timer.elapsed_s
+
+        step_time_s = step_timer.elapsed_s
         local_tokens = config.batch_size * config.seq_len * config.grad_accum_steps
         global_tokens = reduce_sum(float(local_tokens), device)
         avg_loss = reduce_mean(loss_value, device)
         avg_step_time_s = reduce_mean(step_time_s, device)
+        avg_forward_s = reduce_mean(forward_s, device)
+        avg_backward_s = reduce_mean(backward_s, device)
+        avg_optimizer_s = reduce_mean(optimizer_s, device)
         global_tokens_per_second = global_tokens / avg_step_time_s
         rank_tokens_per_second = local_tokens / step_time_s
 
@@ -139,6 +218,9 @@ def main() -> None:
             "loss": avg_loss,
             "lr": lr,
             "step_time_ms": avg_step_time_s * 1000.0,
+            "forward_ms": avg_forward_s * 1000.0,
+            "backward_ms": avg_backward_s * 1000.0,
+            "optimizer_ms": avg_optimizer_s * 1000.0,
             "rank_tokens_per_second": rank_tokens_per_second,
             "global_tokens_per_second": global_tokens_per_second,
         }
@@ -146,6 +228,10 @@ def main() -> None:
 
         if is_main_process() and step % config.log_interval == 0:
             print(json.dumps(entry))
+
+    summary = summarize_metrics(metrics, args.warmup_discard)
+    if is_main_process():
+        print(json.dumps({"event": "summary", **summary}))
 
     if args.metrics_path and is_main_process():
         with open(args.metrics_path, "w", encoding="utf-8") as handle:
@@ -155,6 +241,8 @@ def main() -> None:
                     "world_size": get_world_size(),
                     "backend": actual_backend,
                     "parameter_count": parameter_count,
+                    "environment": environment,
+                    "summary": summary,
                     "metrics": metrics,
                 },
                 handle,

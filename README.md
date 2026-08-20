@@ -1,35 +1,44 @@
 # Distributed-Training
 
-Mini LLM training infrastructure project built step by step for AI Infra /
-Training Engineer interviews.
+Mini LLM training infrastructure project for AI Infra / Distributed Training
+Engineer interviews.
+
+Long-term context and learning background: [`AI_INFRA_CONTEXT.md`](./AI_INFRA_CONTEXT.md).
 
 ## Current milestone
 
-Phase 1 implements a measurable distributed training baseline:
+**Project 1 / Phase 1 (Stage 1-2): DDP baseline**
 
-- minimal Transformer language model,
-- synthetic next-token training workload,
-- PyTorch DDP training loop,
-- single-node multi-process launcher,
-- structured metrics for throughput and step time.
+- minimal Transformer language model
+- synthetic next-token workload
+- PyTorch DDP training loop
+- forward / backward / optimizer timing breakdown
+- correctness tests
+- DDP scaling benchmark script
+- RFC + experiment documentation
 
-This project intentionally starts with DDP before adding tensor parallelism,
-pipeline parallelism, and distributed checkpointing. The reason is simple: if the
-baseline training loop and metrics are not trustworthy, every later scaling or
-optimization claim becomes weak.
+This intentionally comes before Tensor Parallelism / Pipeline Parallelism /
+Checkpoint Resharding. If the baseline training loop and metrics are not
+trustworthy, later optimization claims become weak.
 
 ## Repository layout
 
 ```text
+AI_INFRA_CONTEXT.md
 src/mini_training/
-  config.py         Training configuration
-  data.py           Synthetic token workload
-  distributed.py    Distributed utilities
-  model.py          Minimal Transformer LM
-  train.py          DDP training entrypoint
+  config.py
+  data.py
+  distributed.py
+  model.py
+  train.py
 scripts/
   run_single_node_ddp.sh
+  benchmark_ddp_scaling.sh
+tests/
+  test_phase1_correctness.py
 docs/
+  design/RFC-001-phase1-ddp-baseline.md
+  experiments/phase1-ddp-scaling.md
   phase1-roadmap.md
   phase1-implementation-notes.md
 ```
@@ -42,7 +51,7 @@ source .venv/bin/activate
 pip install -e .
 ```
 
-If `venv` is unavailable on the machine, use:
+If `venv` is unavailable:
 
 ```bash
 python3 -m pip install --break-system-packages torch
@@ -64,36 +73,48 @@ chmod +x scripts/run_single_node_ddp.sh
 NPROC_PER_NODE=2 ./scripts/run_single_node_ddp.sh --steps 10 --batch-size 4 --seq-len 128
 ```
 
-When CUDA is available, the code uses NCCL. On CPU-only machines, it falls back
+When CUDA is available, the code uses NCCL. On CPU-only machines it falls back
 to Gloo so the training loop can still be validated.
+
+### Correctness tests
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+### Scaling benchmark
+
+```bash
+chmod +x scripts/benchmark_ddp_scaling.sh
+WORLD_SIZES=1,2 BACKEND=gloo STEPS=6 ./scripts/benchmark_ddp_scaling.sh
+```
 
 ## Metrics
 
-Each training step logs JSON records with:
+Each step logs:
 
 - `loss`
 - `step_time_ms`
+- `forward_ms`
+- `backward_ms`
+- `optimizer_ms`
 - `rank_tokens_per_second`
 - `global_tokens_per_second`
 
-You can also write a full metrics file:
+Metrics files also include:
 
-```bash
-python3 -m mini_training.train --steps 5 --metrics-path metrics.json
-```
+- environment metadata (device, backend, commit, PyTorch version)
+- summary averages after warm-up discard
 
-## Why this version matters for interviews
+## Important rule
 
-This first phase already gives you material to explain:
+Never report fabricated performance numbers. CPU Gloo smoke results are useful
+for correctness and instrumentation checks, but are **not** GPU / NCCL training
+portfolio claims.
 
-- how DDP performs gradient synchronization,
-- why distributed training needs process-level launch control,
-- how to compare 1 GPU vs 2 GPU vs 4 GPU throughput,
-- what data you would collect before attempting optimization.
+## Next stages (Project 1)
 
-## Planned next steps
-
-1. Add tensor parallel linear layers and communication primitives.
-2. Add pipeline stage partitioning and a simple schedule.
-3. Add distributed checkpoint save/resume/reshard.
-4. Add profiling workflow and scaling experiments.
+1. Tensor Parallel Linear (`ColumnParallel` / `RowParallel`)
+2. Pipeline Parallel + 1F1B
+3. Distributed Checkpoint save/resume/reshard
+4. Profiling hooks and communication/computation overlap

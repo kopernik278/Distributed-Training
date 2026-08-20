@@ -22,8 +22,11 @@ This is the foundation for every later optimization story in interview settings.
 - Metrics logging:
   - loss
   - step time
+  - forward / backward / optimizer time
   - rank tokens/s
   - global tokens/s
+- Correctness tests
+- Scaling benchmark script
 
 ## Interview relevance
 
@@ -32,7 +35,8 @@ This phase prepares you to explain:
 - what DDP synchronizes and when,
 - why global batch size scales with world size,
 - how step time changes from 1 GPU to N GPUs,
-- how to separate compute bottlenecks from communication bottlenecks.
+- how to separate compute bottlenecks from communication bottlenecks,
+- why warm-up discard and environment metadata matter for experiment quality.
 
 ## Next phases
 
