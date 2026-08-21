@@ -30,6 +30,8 @@ class TrainingConfig:
     ddp_bucket_cap_mb: float = 25.0
     sequence_parallel: bool = False
     vocab_parallel: bool = False
+    dataset: str = "random"
+    data_dir: str = "data"
 
     @property
     def tokens_per_step_per_rank(self) -> int:

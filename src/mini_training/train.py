@@ -13,7 +13,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from .checkpoint import load_checkpoint, save_checkpoint, unwrap_model
 from .config import TrainingConfig
-from .data import RandomTokenDataset
+from .data import RandomTokenDataset, WikiText2Dataset, build_dataset
 from .distributed import (
     Timer,
     barrier,
@@ -135,6 +135,19 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Shard vocab embedding/LM head across TP (requires tp>1 and vocab %% tp == 0)",
     )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="random",
+        choices=["random", "wikitext2"],
+        help="Training data: synthetic random tokens or WikiText-2 (downloaded on demand)",
+    )
+    parser.add_argument(
+        "--data-dir",
+        type=str,
+        default="data",
+        help="Cache directory for real datasets (WikiText-2)",
+    )
     return parser.parse_args()
 
 
@@ -170,6 +183,8 @@ def build_config(args: argparse.Namespace) -> TrainingConfig:
         ddp_bucket_cap_mb=float(args.ddp_bucket_cap_mb),
         sequence_parallel=bool(args.sequence_parallel),
         vocab_parallel=bool(args.vocab_parallel),
+        dataset=str(args.dataset),
+        data_dir=str(args.data_dir),
     )
 
 
@@ -302,7 +317,7 @@ def _wrap_ddp(model: torch.nn.Module, device: torch.device, config: TrainingConf
 
 def _run_non_pipeline_step(
     model: torch.nn.Module,
-    dataset: RandomTokenDataset,
+    dataset: RandomTokenDataset | WikiText2Dataset,
     config: TrainingConfig,
     device: torch.device,
 ) -> tuple[float, float, float]:
@@ -329,7 +344,7 @@ def _run_non_pipeline_step(
 
 def _run_pipeline_step(
     engine: PipelineEngine,
-    dataset: RandomTokenDataset,
+    dataset: RandomTokenDataset | WikiText2Dataset,
     config: TrainingConfig,
     device: torch.device,
 ) -> tuple[float, float, float]:
@@ -422,10 +437,14 @@ def main() -> None:
 
     # All PP ranks in a DP replica share the same microbatch stream (first uses
     # tokens, last uses targets; shapes must match for P2P).
-    dataset = RandomTokenDataset(
+    dataset = build_dataset(
         config,
         device,
+        dataset_name=config.dataset,
+        data_dir=config.data_dir,
         seed=config.seed + 10_000 + get_data_parallel_rank() + 1_000_000 * start_step,
+        dp_rank=get_data_parallel_rank(),
+        dp_size=get_data_parallel_world_size(),
     )
     set_seed(config.seed + 20_000 + get_data_parallel_rank() + 1_000_000 * start_step)
 

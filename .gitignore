@@ -7,5 +7,6 @@ ddp_metrics.json
 results/
 profiles/
 checkpoints/
+data/
 *.pt
 *.pth
