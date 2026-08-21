@@ -8,9 +8,10 @@ If you are **not** already an infra engineer, start here:
 
 ## Current milestone
 
-**Project 1 / Phase 7: Communication / computation overlap**
+**Project 1 / Phase 8: Delayed RowParallel forward AllReduce wait**
 
-Phases 1–6 remain: DDP, TP, DP×TP, Pipeline 1F1B, Checkpoint, Profiler.
+Phases 1–7 remain: DDP, TP, DP×TP, Pipeline 1F1B, Checkpoint, Profiler,
+ColumnParallel backward overlap.
 
 ## Tests
 
@@ -25,11 +26,16 @@ python3 -m unittest discover -s tests -v
 BACKEND=gloo ./scripts/run_tp.sh 2 --steps 3 --hidden-size 64 --num-heads 8 --overlap
 ```
 
-ColumnParallel backward launches `AllReduce(dX)` and computes `dW` before waiting.
+Under `--overlap`:
+
+1. ColumnParallel backward: `AllReduce(dX)` overlaps `dW` GEMM
+2. RowParallel forward: AllReduce wait is delayed until `finalize` / residual
+   (`skip_bias_add` + flush)
+
 Tiny CPU models will not speed up; use GPU traces to see NCCL under GEMM.
 
 ## Next stages
 
-1. Hide RowParallel forward AllReduce behind the next layer
-2. Optional Adam-state TP reshard / PP consolidate
-3. Optional larger-model multi-GPU overlap measurements
+1. Optional Adam-state TP reshard / PP consolidate
+2. Optional larger-model multi-GPU overlap measurements
+3. Sequence / vocab parallel

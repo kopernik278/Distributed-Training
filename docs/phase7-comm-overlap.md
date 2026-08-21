@@ -33,5 +33,5 @@ Use Phase 6 traces on RunPod to *look* for NCCL under `aten::mm`.
 
 ## Next
 
-- Delayed wait to hide RowParallel *forward* AllReduce behind the next layer
 - Optional RunPod overlap vs no-overlap measurement on a larger hidden size
+- See Phase 8 for delayed RowParallel forward wait: `docs/phase8-delayed-rowparallel-reduce.md`

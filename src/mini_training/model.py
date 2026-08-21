@@ -8,6 +8,8 @@ import torch.nn.functional as F
 
 from .config import TrainingConfig
 from .layers import ColumnParallelLinear, RowParallelLinear
+from .mappings import finalize_tensor_parallel_output
+from .overlap import flush_pending_tp_reduces
 from .parallel_state import (
     ensure_divisible,
     get_pipeline_model_parallel_rank,
@@ -43,6 +45,7 @@ class TensorParallelAttention(nn.Module):
             hidden_size,
             bias=True,
             input_is_parallel=True,
+            skip_bias_add=True,
         )
         self.attn_dropout = nn.Dropout(dropout)
 
@@ -70,14 +73,20 @@ class TensorParallelMLP(nn.Module):
         ensure_divisible(ff_size, tp_size, "mlp_hidden_size")
 
         self.fc1 = ColumnParallelLinear(hidden_size, ff_size, bias=True, gather_output=False)
-        self.fc2 = RowParallelLinear(ff_size, hidden_size, bias=True, input_is_parallel=True)
+        self.fc2 = RowParallelLinear(
+            ff_size,
+            hidden_size,
+            bias=True,
+            input_is_parallel=True,
+            skip_bias_add=True,
+        )
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.fc1(x)
         x = F.gelu(x)
-        x = self.fc2(x)
-        return self.dropout(x)
+        # RowParallel may leave AllReduce pending; caller finalizes before dropout/residual.
+        return self.fc2(x)
 
 
 class TransformerBlock(nn.Module):
@@ -89,8 +98,19 @@ class TransformerBlock(nn.Module):
         self.mlp = TensorParallelMLP(hidden_size, mlp_ratio, dropout)
 
     def forward(self, x: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.ln1(x), attn_mask)
-        x = x + self.mlp(self.ln2(x))
+        # Attention: RowParallel may leave an async AllReduce pending (--overlap).
+        # Flush + bias happen here so residual sees the reduced sum; any independent
+        # default-stream work could be inserted before finalize.
+        residual = x
+        attn_out = self.attn(self.ln1(x), attn_mask)
+        attn_out = finalize_tensor_parallel_output(attn_out, self.attn.out_proj.bias)
+        x = residual + attn_out
+
+        residual = x
+        mlp_out = self.mlp(self.ln2(x))
+        mlp_out = finalize_tensor_parallel_output(mlp_out, self.mlp.fc2.bias)
+        mlp_out = self.mlp.dropout(mlp_out)
+        x = residual + mlp_out
         return x
 
 
@@ -149,6 +169,7 @@ class MiniTransformerLM(nn.Module):
         mask = self.causal_mask[:seq_len, :seq_len]
         for block in self.blocks:
             x = block(x, attn_mask=mask)
+        flush_pending_tp_reduces()
         x = self.final_norm(x)
         return self.lm_head(x)
 
@@ -251,8 +272,10 @@ class PipelineStage(nn.Module):
         if self.is_last:
             assert self.final_norm is not None
             assert self.lm_head is not None
+            flush_pending_tp_reduces()
             x = self.final_norm(x)
             return self.lm_head(x)
+        flush_pending_tp_reduces()
         return x
 
 

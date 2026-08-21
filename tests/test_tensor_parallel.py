@@ -190,6 +190,112 @@ def _tp2_overlap_worker(rank: int, world_size: int, result_queue) -> None:
     dist.destroy_process_group()
 
 
+def _tp2_delayed_row_worker(rank: int, world_size: int, result_queue) -> None:
+    """skip_bias_add + delayed reduce must match sync finalize path; pending clears on flush."""
+    from mini_training.mappings import finalize_tensor_parallel_output
+    from mini_training.overlap import has_pending_tp_reduces, set_overlap_enabled
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = "29534"
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
+    destroy_model_parallel()
+    initialize_model_parallel(tensor_model_parallel_size=2)
+
+    torch.manual_seed(7)
+    dense = nn.Linear(16, 8)
+    torch.manual_seed(7)
+    dense.reset_parameters()
+    for tensor in dense.parameters():
+        dist.broadcast(tensor.data, src=0)
+
+    x = torch.randn(2, 3, 16)
+    dist.broadcast(x, src=0)
+    # RowParallel with input_is_parallel expects already-split last dim.
+    local = 8
+    x_local = x[..., rank * local : (rank + 1) * local].contiguous()
+
+    def _build(skip_bias_add: bool) -> RowParallelLinear:
+        row = RowParallelLinear(16, 8, bias=True, input_is_parallel=True, skip_bias_add=skip_bias_add)
+        with torch.no_grad():
+            row.weight.copy_(shard_row_weight(dense.weight.data, rank, 2))
+            row.bias.copy_(dense.bias.data)
+        return row
+
+    set_overlap_enabled(False)
+    row_sync = _build(skip_bias_add=False)
+    y_sync = row_sync(x_local.clone())
+    y_sync.square().mean().backward()
+
+    set_overlap_enabled(True)
+    row_ov = _build(skip_bias_add=True)
+    y_pending = row_ov(x_local.clone())
+    had_pending = has_pending_tp_reduces()
+    y_ov = finalize_tensor_parallel_output(y_pending, row_ov.bias)
+    still_pending = has_pending_tp_reduces()
+    y_ov.square().mean().backward()
+
+    y_err = (y_sync.detach() - y_ov.detach()).abs().max().item()
+    w_err = (row_sync.weight.grad - row_ov.weight.grad).abs().max().item()
+    set_overlap_enabled(False)
+    result_queue.put((rank, y_err, w_err, had_pending, still_pending))
+    destroy_model_parallel()
+    dist.destroy_process_group()
+
+
+def _tp2_block_overlap_worker(rank: int, world_size: int, result_queue) -> None:
+    """Full MiniTransformerLM forward/backward: overlap path matches sync."""
+    from mini_training.overlap import set_overlap_enabled
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = "29535"
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
+    destroy_model_parallel()
+    initialize_model_parallel(tensor_model_parallel_size=2)
+
+    config = TrainingConfig(
+        vocab_size=64,
+        seq_len=8,
+        hidden_size=32,
+        num_layers=2,
+        num_heads=4,
+        mlp_ratio=2,
+        dropout=0.0,
+        tensor_parallel_size=2,
+    )
+    input_ids = torch.randint(0, config.vocab_size, (2, config.seq_len))
+    dist.broadcast(input_ids, src=0)
+
+    def _run(overlap: bool):
+        set_overlap_enabled(overlap)
+        torch.manual_seed(99)
+        model = MiniTransformerLM(config)
+        # Align shards: broadcast all parameters from rank0 then re-shard is hard;
+        # instead broadcast full state after building on each rank with same seed.
+        for p in model.parameters():
+            dist.broadcast(p.data, src=0)
+        logits = model(input_ids)
+        loss = logits.float().pow(2).mean()
+        loss.backward()
+        grads = {n: p.grad.detach().clone() for n, p in model.named_parameters() if p.grad is not None}
+        return logits.detach(), grads
+
+    logits_sync, grads_sync = _run(False)
+    logits_ov, grads_ov = _run(True)
+    set_overlap_enabled(False)
+
+    y_err = (logits_sync - logits_ov).abs().max().item()
+    g_err = 0.0
+    for name, g in grads_sync.items():
+        g_err = max(g_err, (g - grads_ov[name]).abs().max().item())
+    result_queue.put((rank, y_err, g_err))
+    destroy_model_parallel()
+    dist.destroy_process_group()
+
+
 class TensorParallelMultiProcessTests(unittest.TestCase):
     def test_column_row_mlp_matches_dense_tp2(self) -> None:
         import torch.multiprocessing as mp
@@ -233,6 +339,50 @@ class TensorParallelMultiProcessTests(unittest.TestCase):
         for rank, y_err, w_err, _x_err in results:
             self.assertLess(y_err, 1e-5, msg=f"rank {rank} y_err={y_err}")
             self.assertLess(w_err, 1e-5, msg=f"rank {rank} w_err={w_err}")
+
+    def test_delayed_row_reduce_matches_sync_tp2(self) -> None:
+        import torch.multiprocessing as mp
+
+        world_size = 2
+        ctx = mp.get_context("spawn")
+        result_queue = ctx.SimpleQueue()
+        processes = []
+        for rank in range(world_size):
+            process = ctx.Process(target=_tp2_delayed_row_worker, args=(rank, world_size, result_queue))
+            process.start()
+            processes.append(process)
+
+        results = [result_queue.get() for _ in range(world_size)]
+        for process in processes:
+            process.join(timeout=120)
+            self.assertEqual(process.exitcode, 0)
+
+        for rank, y_err, w_err, had_pending, still_pending in results:
+            self.assertTrue(had_pending, msg=f"rank {rank} expected pending AllReduce before flush")
+            self.assertFalse(still_pending, msg=f"rank {rank} pending should clear after finalize")
+            self.assertLess(y_err, 1e-5, msg=f"rank {rank} y_err={y_err}")
+            self.assertLess(w_err, 1e-5, msg=f"rank {rank} w_err={w_err}")
+
+    def test_block_overlap_matches_sync_tp2(self) -> None:
+        import torch.multiprocessing as mp
+
+        world_size = 2
+        ctx = mp.get_context("spawn")
+        result_queue = ctx.SimpleQueue()
+        processes = []
+        for rank in range(world_size):
+            process = ctx.Process(target=_tp2_block_overlap_worker, args=(rank, world_size, result_queue))
+            process.start()
+            processes.append(process)
+
+        results = [result_queue.get() for _ in range(world_size)]
+        for process in processes:
+            process.join(timeout=180)
+            self.assertEqual(process.exitcode, 0)
+
+        for rank, y_err, g_err in results:
+            self.assertLess(y_err, 1e-5, msg=f"rank {rank} y_err={y_err}")
+            self.assertLess(g_err, 1e-5, msg=f"rank {rank} g_err={g_err}")
 
 
 if __name__ == "__main__":

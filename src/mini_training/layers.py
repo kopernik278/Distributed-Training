@@ -7,11 +7,12 @@ from torch import nn
 import torch.nn.functional as F
 
 from .mappings import (
+    finalize_tensor_parallel_output,
     gather_from_tensor_model_parallel_region,
     reduce_from_tensor_model_parallel_region,
     scatter_to_tensor_model_parallel_region,
 )
-from .overlap import async_tp_all_reduce, wait_tp_all_reduce
+from .overlap import async_tp_all_reduce, flush_pending_tp_reduces, wait_tp_all_reduce
 from .parallel_state import (
     get_tensor_model_parallel_world_size,
 )
@@ -99,6 +100,9 @@ class ColumnParallelLinear(nn.Module):
             nn.init.zeros_(self.bias)
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
+        # Ensure any delayed RowParallel forward reduce finished before this GEMM
+        # consumes activations (safety net when callers forget an explicit flush).
+        flush_pending_tp_reduces()
         # Fused linear + input-grad AllReduce so backward can overlap comm with dW GEMM.
         output_parallel = _ColumnParallelLinearFn.apply(
             input_,
@@ -115,6 +119,10 @@ class RowParallelLinear(nn.Module):
 
     Weight is partitioned along the input dimension.
     Y = X A + b, where A is split by rows across TP ranks, then outputs are AllReduced.
+
+    When ``skip_bias_add`` is True, bias is returned to the caller via
+    ``self.bias`` and must be applied after ``finalize_tensor_parallel_output``
+    (Megatron-style delayed wait under ``--overlap``).
     """
 
     def __init__(
@@ -124,11 +132,13 @@ class RowParallelLinear(nn.Module):
         *,
         bias: bool = True,
         input_is_parallel: bool = False,
+        skip_bias_add: bool = False,
     ) -> None:
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.input_is_parallel = input_is_parallel
+        self.skip_bias_add = skip_bias_add
 
         tp_size = get_tensor_model_parallel_world_size()
         if in_features % tp_size != 0:
@@ -157,10 +167,12 @@ class RowParallelLinear(nn.Module):
         else:
             input_parallel = scatter_to_tensor_model_parallel_region(input_)
         output_parallel = F.linear(input_parallel, self.weight)
+        # Under --overlap this AllReduce is async; wait is delayed until finalize /
+        # flush (caller with skip_bias_add) or until we add bias below.
         output = reduce_from_tensor_model_parallel_region(output_parallel)
-        if self.bias is not None:
-            output = output + self.bias
-        return output
+        if self.skip_bias_add:
+            return output
+        return finalize_tensor_parallel_output(output, self.bias)
 
 
 def shard_column_weight(full_weight: torch.Tensor, tp_rank: int, tp_size: int) -> torch.Tensor:

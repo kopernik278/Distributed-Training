@@ -46,5 +46,5 @@ would surprise users comparing Phase 2 numbers; default **off**, opt-in.
 
 ## Future
 
-- CUDA dedicated comm stream + `wait_stream` for RowParallel forward
+- Done in Phase 8: delayed RowParallel forward AllReduce wait (`RFC-008`)
 - Overlap optimizer with last DDP bucket

@@ -126,18 +126,30 @@ Save **unique** pieces (`dp_rank==0` only). File name encodes `pp` and `tp`.
 
 ---
 
-## 7. Phase 6–7 — Profiling then overlap
+## 7. Phase 6–8 — Profiling then overlap
 
-Profiler = labeled stopwatch (Chrome trace). Overlap = hide AllReduce behind a GEMM that
-does not need the AllReduce result.
+Profiler = labeled stopwatch (Chrome trace). Overlap = hide AllReduce behind compute
+that does not need the AllReduce result yet.
 
-ColumnParallel backward:
+**ColumnParallel backward** (Phase 7):
 
 ```text
 dX_local = dY @ W     → start AllReduce(dX)
 dW = X^T @ dY         → can run at the same time
 then wait for AllReduce
 ```
+
+**RowParallel forward** (Phase 8):
+
+```text
+local GEMM → start AllReduce(Y)
+  (caller may do other work)
+flush → add bias → residual → next layer
+```
+
+`TransformerBlock` uses Megatron-style `skip_bias_add` and
+`finalize_tensor_parallel_output` so the wait sits at the residual, not inside
+the collective helper.
 
 Turn on with `--overlap`. Tiny CPU models will not get faster; this is a GPU pattern.
 

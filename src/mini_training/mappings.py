@@ -3,7 +3,13 @@ from __future__ import annotations
 import torch
 import torch.distributed as dist
 
-from .overlap import async_tp_all_reduce, wait_tp_all_reduce
+from .overlap import (
+    async_tp_all_reduce,
+    flush_pending_tp_reduces,
+    overlap_enabled,
+    register_pending_tp_reduce,
+    wait_tp_all_reduce,
+)
 from .parallel_state import (
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
@@ -46,8 +52,17 @@ def _gather_along_last_dim(input_: torch.Tensor) -> torch.Tensor:
     return torch.cat(tensor_list, dim=-1).contiguous()
 
 
-def _reduce(input_: torch.Tensor) -> torch.Tensor:
+def _reduce(input_: torch.Tensor, *, delay: bool = False) -> torch.Tensor:
+    """In-place SUM AllReduce on ``input_``.
+
+    When ``delay`` and ``--overlap``: launch async, register pending, do not wait.
+    Caller must ``flush_pending_tp_reduces`` before reading the values.
+    """
     if _tp_size() == 1:
+        return input_
+    if delay and overlap_enabled():
+        work = async_tp_all_reduce(input_)
+        register_pending_tp_reduce(work, input_)
         return input_
     work = async_tp_all_reduce(input_)
     wait_tp_all_reduce(work, input_)
@@ -63,7 +78,8 @@ class _CopyToModelParallelRegion(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):  # type: ignore[override]
-        return _reduce(grad_output.clone())
+        # Input-grad reduce must complete before the previous layer reads dX.
+        return _reduce(grad_output.clone(), delay=False)
 
 
 class _ReduceFromModelParallelRegion(torch.autograd.Function):
@@ -71,7 +87,8 @@ class _ReduceFromModelParallelRegion(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, input_: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
-        return _reduce(input_.clone())
+        # Phase 8: under --overlap, delay wait until flush (e.g. before residual).
+        return _reduce(input_.clone(), delay=True)
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):  # type: ignore[override]
@@ -116,3 +133,14 @@ def scatter_to_tensor_model_parallel_region(input_: torch.Tensor) -> torch.Tenso
 
 def gather_from_tensor_model_parallel_region(input_: torch.Tensor) -> torch.Tensor:
     return _GatherFromModelParallelRegion.apply(input_)
+
+
+def finalize_tensor_parallel_output(
+    output: torch.Tensor,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Flush delayed TP reduces, then optionally add a replicated bias."""
+    flush_pending_tp_reduces()
+    if bias is not None:
+        output = output + bias
+    return output

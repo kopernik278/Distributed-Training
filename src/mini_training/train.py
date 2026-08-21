@@ -108,7 +108,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--overlap",
         action="store_true",
-        help="Overlap TP AllReduce(dX) with dW GEMM; enable DDP bucket overlap knobs",
+        help=(
+            "Overlap TP collectives with compute: ColumnParallel backward AllReduce(dX)||dW; "
+            "delay RowParallel forward AllReduce wait until finalize/residual; DDP bucket knobs"
+        ),
     )
     parser.add_argument(
         "--ddp-bucket-cap-mb",
@@ -414,6 +417,7 @@ def main() -> None:
                     "parameter_count": parameter_count,
                     "environment": environment,
                     "profiling": bool(args.profile_dir),
+                    "overlap": config.overlap,
                 }
             )
         )
