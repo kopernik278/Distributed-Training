@@ -5,16 +5,17 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 
-from .model import cross_entropy_loss
-from .profiler import record_range
+from .model import compute_language_model_loss
 from .parallel_state import (
     get_pipeline_model_parallel_next_rank,
     get_pipeline_model_parallel_prev_rank,
     get_pipeline_model_parallel_rank,
     get_pipeline_model_parallel_world_size,
+    get_tensor_model_parallel_world_size,
     is_pipeline_first_stage,
     is_pipeline_last_stage,
 )
+from .profiler import record_range
 
 
 @dataclass
@@ -55,6 +56,8 @@ class PipelineEngine:
         num_microbatches: int,
         hidden_size: int,
         dtype: torch.dtype = torch.float32,
+        sequence_parallel: bool = False,
+        vocab_parallel: bool = False,
     ) -> None:
         if num_microbatches < 1:
             raise ValueError("num_microbatches must be >= 1")
@@ -62,8 +65,16 @@ class PipelineEngine:
         self.num_microbatches = num_microbatches
         self.hidden_size = hidden_size
         self.dtype = dtype
+        self.sequence_parallel = sequence_parallel
+        self.vocab_parallel = vocab_parallel
         self.pp_size = get_pipeline_model_parallel_world_size()
         self.pp_rank = get_pipeline_model_parallel_rank()
+        self.tp_size = get_tensor_model_parallel_world_size()
+
+    def _activation_seq_len(self, full_seq_len: int) -> int:
+        if self.sequence_parallel and self.tp_size > 1:
+            return full_seq_len // self.tp_size
+        return full_seq_len
 
     def _recv_forward(self, batch_size: int, seq_len: int, device: torch.device) -> torch.Tensor:
         prev = get_pipeline_model_parallel_prev_rank()
@@ -102,8 +113,9 @@ class PipelineEngine:
         if is_pipeline_first_stage():
             output = self.stage(input_ids=mb.input_ids)
         else:
-            batch_size, seq_len = mb.input_ids.shape
-            hidden = self._recv_forward(batch_size, seq_len, device)
+            batch_size, full_seq = mb.input_ids.shape
+            act_seq = self._activation_seq_len(full_seq)
+            hidden = self._recv_forward(batch_size, act_seq, device)
             hidden = hidden.detach().requires_grad_(True)
             input_activation = hidden
             output = self.stage(hidden_states=hidden)
@@ -111,7 +123,12 @@ class PipelineEngine:
         loss: torch.Tensor | None = None
         send_req: dist.Work | None = None
         if is_pipeline_last_stage():
-            loss = cross_entropy_loss(output, mb.targets) / self.num_microbatches
+            loss = (
+                compute_language_model_loss(
+                    output, mb.targets, vocab_parallel=self.vocab_parallel
+                )
+                / self.num_microbatches
+            )
         else:
             send_req = self._send_forward_async(output.detach())
 

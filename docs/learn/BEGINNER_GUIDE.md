@@ -159,7 +159,21 @@ A second point with a smaller batch was slightly slower; overlap is not free.
 
 ---
 
-## 8. How you can participate (practical)
+## 8. Phase 9 — Sequence Parallel and Vocab Parallel
+
+**Sequence Parallel:** shard the sequence axis so LayerNorm/residual see
+`[B, S/tp, H]`. Column AllGathers sequence before GEMM; Row ReduceScatters after.
+
+**Vocab Parallel:** shard embedding / LM-head vocab; loss uses parallel CE so you
+never allocate full `[B, S, V]` logits.
+
+```bash
+BACKEND=gloo ./scripts/run_tp.sh 2 --steps 3 --seq-len 64 --sequence-parallel --vocab-parallel
+```
+
+---
+
+## 9. How you can participate (practical)
 
 You do not need to write kernels. Useful loops:
 
@@ -179,15 +193,16 @@ Then open `/tmp/prof_demo/rank0_summary.txt` (Chrome JSON on CPU is still useful
 
 ---
 
-## 9. Map of source files
+## 10. Map of source files
 
 | File | Job |
 |--|--|
 | `parallel_state.py` | Who is in which group (dp/pp/tp ranks) |
-| `mappings.py` | TP collectives + backward |
-| `layers.py` | Column/Row Linear |
+| `mappings.py` | TP / SP collectives + backward |
+| `layers.py` | Column/Row Linear, VocabParallelEmbedding |
 | `model.py` | Transformer + `PipelineStage` |
 | `pipeline.py` | 1F1B schedule |
 | `checkpoint.py` | save / resume / TP reshard |
 | `profiler.py` | Chrome trace export |
+| `overlap.py` | Async TP AllReduce + flush |
 | `train.py` | CLI glue |

@@ -26,7 +26,12 @@ from .distributed import (
     reduce_mean,
     set_seed,
 )
-from .model import MiniTransformerLM, PipelineStage, cross_entropy_loss, model_parameter_count
+from .model import (
+    MiniTransformerLM,
+    PipelineStage,
+    compute_language_model_loss,
+    model_parameter_count,
+)
 from .parallel_state import (
     broadcast_parameters_within_dp,
     destroy_model_parallel,
@@ -120,6 +125,16 @@ def parse_args() -> argparse.Namespace:
         default=25.0,
         help="DDP gradient bucket size in MiB (smaller ⇒ more overlap chances, more launch overhead)",
     )
+    parser.add_argument(
+        "--sequence-parallel",
+        action="store_true",
+        help="Shard sequence dim across TP (requires tp>1 and seq_len %% tp == 0)",
+    )
+    parser.add_argument(
+        "--vocab-parallel",
+        action="store_true",
+        help="Shard vocab embedding/LM head across TP (requires tp>1 and vocab %% tp == 0)",
+    )
     return parser.parse_args()
 
 
@@ -153,6 +168,8 @@ def build_config(args: argparse.Namespace) -> TrainingConfig:
         log_interval=args.log_interval,
         overlap=bool(args.overlap),
         ddp_bucket_cap_mb=float(args.ddp_bucket_cap_mb),
+        sequence_parallel=bool(args.sequence_parallel),
+        vocab_parallel=bool(args.vocab_parallel),
     )
 
 
@@ -244,6 +261,22 @@ def validate_parallel_sizes(world_size: int, config: TrainingConfig) -> int:
         )
     if config.pipeline_parallel_size > 1 and config.num_microbatches < 1:
         raise ValueError("num_microbatches must be >= 1 when pipeline parallel is enabled")
+    if config.sequence_parallel:
+        if config.tensor_parallel_size <= 1:
+            raise ValueError("sequence_parallel requires tensor_parallel_size > 1")
+        if config.seq_len % config.tensor_parallel_size != 0:
+            raise ValueError(
+                f"seq_len={config.seq_len} must be divisible by "
+                f"tensor_parallel_size={config.tensor_parallel_size} when sequence_parallel"
+            )
+    if config.vocab_parallel:
+        if config.tensor_parallel_size <= 1:
+            raise ValueError("vocab_parallel requires tensor_parallel_size > 1")
+        if config.vocab_size % config.tensor_parallel_size != 0:
+            raise ValueError(
+                f"vocab_size={config.vocab_size} must be divisible by "
+                f"tensor_parallel_size={config.tensor_parallel_size} when vocab_parallel"
+            )
     inferred_dp = world_size // model_parallel
     if config.data_parallel_size is not None and config.data_parallel_size != inferred_dp:
         raise ValueError(
@@ -280,7 +313,12 @@ def _run_non_pipeline_step(
         inputs, targets = dataset.next_batch()
         with Timer(device) as forward_timer:
             logits = model(inputs)
-            loss = cross_entropy_loss(logits, targets) / config.grad_accum_steps
+            loss = (
+                compute_language_model_loss(
+                    logits, targets, vocab_parallel=config.vocab_parallel
+                )
+                / config.grad_accum_steps
+            )
         forward_s += forward_timer.elapsed_s
         with Timer(device) as backward_timer:
             loss.backward()
@@ -400,6 +438,8 @@ def main() -> None:
             num_microbatches=config.num_microbatches,
             hidden_size=config.hidden_size,
             dtype=param.dtype,
+            sequence_parallel=config.sequence_parallel,
+            vocab_parallel=config.vocab_parallel,
         )
 
     environment = collect_environment(device, actual_backend)

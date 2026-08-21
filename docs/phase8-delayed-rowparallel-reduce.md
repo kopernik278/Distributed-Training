@@ -28,8 +28,5 @@ python3 -m unittest tests.test_tensor_parallel.TensorParallelMultiProcessTests -
 
 ## Next
 
+- Sequence / Vocab Parallel: `docs/phase9-sequence-vocab-parallel.md`
 - Optional Adam-state TP reshard / PP consolidate
-- Sequence / vocab parallel
-
-RunPod measurement: `docs/experiments/phase8-runpod-overlap-results.md`
-(primary hidden=1024: ~+4.2% tok/s with `--overlap` on 2×4090).

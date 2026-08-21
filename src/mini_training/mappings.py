@@ -52,6 +52,44 @@ def _gather_along_last_dim(input_: torch.Tensor) -> torch.Tensor:
     return torch.cat(tensor_list, dim=-1).contiguous()
 
 
+def _split_along_seq_dim(input_: torch.Tensor) -> torch.Tensor:
+    """Split ``[B, S, ...]`` along sequence dim 1."""
+    tp_size = _tp_size()
+    if tp_size == 1:
+        return input_
+    seq = input_.size(1)
+    assert seq % tp_size == 0, "sequence length must be divisible by tp size"
+    local = seq // tp_size
+    start = _tp_rank() * local
+    return input_[:, start : start + local].contiguous()
+
+
+def _gather_along_seq_dim(input_: torch.Tensor) -> torch.Tensor:
+    tp_size = _tp_size()
+    if tp_size == 1:
+        return input_
+    group = _tp_group()
+    tensor_list = [torch.empty_like(input_) for _ in range(tp_size)]
+    with record_range("sp_all_gather"):
+        dist.all_gather(tensor_list, input_.contiguous(), group=group)
+    return torch.cat(tensor_list, dim=1).contiguous()
+
+
+def _reduce_scatter_along_seq_dim(input_: torch.Tensor) -> torch.Tensor:
+    """SUM reduce-scatter of ``[B, S, ...]`` along sequence dim 1 → ``[B, S/tp, ...]``."""
+    tp_size = _tp_size()
+    if tp_size == 1:
+        return input_
+    seq = input_.size(1)
+    assert seq % tp_size == 0, "sequence length must be divisible by tp size"
+    group = _tp_group()
+    chunks = [chunk.contiguous() for chunk in input_.chunk(tp_size, dim=1)]
+    output = torch.empty_like(chunks[0])
+    with record_range("sp_reduce_scatter"):
+        dist.reduce_scatter(output, chunks, group=group)
+    return output
+
+
 def _reduce(input_: torch.Tensor, *, delay: bool = False) -> torch.Tensor:
     """In-place SUM AllReduce on ``input_``.
 
@@ -78,7 +116,6 @@ class _CopyToModelParallelRegion(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):  # type: ignore[override]
-        # Input-grad reduce must complete before the previous layer reads dX.
         return _reduce(grad_output.clone(), delay=False)
 
 
@@ -87,7 +124,6 @@ class _ReduceFromModelParallelRegion(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, input_: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
-        # Phase 8: under --overlap, delay wait until flush (e.g. before residual).
         return _reduce(input_.clone(), delay=True)
 
     @staticmethod
@@ -119,6 +155,42 @@ class _GatherFromModelParallelRegion(torch.autograd.Function):
         return _split_along_last_dim(grad_output)
 
 
+class _ScatterToSequenceParallelRegion(torch.autograd.Function):
+    """Forward split seq; backward AllGather seq."""
+
+    @staticmethod
+    def forward(ctx, input_: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+        return _split_along_seq_dim(input_)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):  # type: ignore[override]
+        return _gather_along_seq_dim(grad_output)
+
+
+class _GatherFromSequenceParallelRegion(torch.autograd.Function):
+    """Forward AllGather seq; backward ReduceScatter seq."""
+
+    @staticmethod
+    def forward(ctx, input_: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+        return _gather_along_seq_dim(input_)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):  # type: ignore[override]
+        return _reduce_scatter_along_seq_dim(grad_output)
+
+
+class _ReduceScatterToSequenceParallelRegion(torch.autograd.Function):
+    """Forward ReduceScatter seq; backward AllGather seq."""
+
+    @staticmethod
+    def forward(ctx, input_: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+        return _reduce_scatter_along_seq_dim(input_.clone())
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):  # type: ignore[override]
+        return _gather_along_seq_dim(grad_output)
+
+
 def copy_to_tensor_model_parallel_region(input_: torch.Tensor) -> torch.Tensor:
     return _CopyToModelParallelRegion.apply(input_)
 
@@ -133,6 +205,18 @@ def scatter_to_tensor_model_parallel_region(input_: torch.Tensor) -> torch.Tenso
 
 def gather_from_tensor_model_parallel_region(input_: torch.Tensor) -> torch.Tensor:
     return _GatherFromModelParallelRegion.apply(input_)
+
+
+def scatter_to_sequence_parallel_region(input_: torch.Tensor) -> torch.Tensor:
+    return _ScatterToSequenceParallelRegion.apply(input_)
+
+
+def gather_from_sequence_parallel_region(input_: torch.Tensor) -> torch.Tensor:
+    return _GatherFromSequenceParallelRegion.apply(input_)
+
+
+def reduce_scatter_to_sequence_parallel_region(input_: torch.Tensor) -> torch.Tensor:
+    return _ReduceScatterToSequenceParallelRegion.apply(input_)
 
 
 def finalize_tensor_parallel_output(
