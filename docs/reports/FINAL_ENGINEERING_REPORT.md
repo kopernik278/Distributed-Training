@@ -1,211 +1,190 @@
 # Final Engineering Report — Mini Distributed Training Engine
 
 **Branch:** `cursor/mini-training-engine-phase1-ed3e`  
-**Primary measured commits:** `331308d` (2-GPU engineering suite), `5f28bd8` (PP import fix + PP follow-ups)  
-**Dataset:** WikiText-2 (word-level, vocab capped to `--vocab-size`)  
-**Policy:** All throughput numbers below are from real RunPod GPU runs via `--metrics-path`. Profiled runs are **not** used for tok/s claims.
+**Policy:** Every tok/s figure below comes from RunPod GPU runs written via `--metrics-path`. Profiled JSON is excluded from throughput claims.
 
 ---
 
-## 1. Scope
+## 1. Executive summary
 
-This report closes the engineering-enhancement pass over Phases 1–9:
+This project implements an interview-oriented Megatron/DeepSpeed-style mini LLM engine across **DDP, TP, DP×TP, PP (1F1B), checkpointing, profiler, comm/compute overlap, Sequence Parallel, and Vocab Parallel**, then stress-tests it with:
 
-| Dimension | Implementation | Measurement |
-|---|---|---|
-| DDP | `DistributedDataParallel` + DP process groups | 1 vs 2 GPU |
-| Tensor Parallel (TP) | Column/Row parallel linear + TP collectives | TP=2 |
-| Pipeline Parallel (PP) | Educational 1F1B + async P2P | PP=2 (reduced / mid configs) |
-| Comm overlap | ColumnParallel bwd + delayed RowParallel wait | TP sync vs `--overlap` |
-| Sequence / Vocab Parallel | SP AG/RS mappings + vocab-parallel CE | TP+SP, TP+SP+VP |
-| Profiler | Chrome traces / text tables | Qualitative only |
-| Data / scale | WikiText-2 + ~160M-param dense LM | 2×4090 suite; 4×4090 attempted |
-
----
-
-## 2. Hardware & software (measured)
-
-### 2-GPU engineering host (`fm3ammwbczam54`)
-
-- **GPUs:** 2× NVIDIA GeForce RTX 4090 (24 GB)
-- **Topology:** `NODE` (no NVLink) — PCIe within NUMA node
-- **Link (during suite):** PCIe Gen4 ×8 (also observed Gen1 under load / other probes)
-- **Stack:** PyTorch `2.8.0+cu128`, CUDA `12.8`, NCCL `2.27.3`, backend `nccl`
-- **Image:** `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404`
-
-### 4-GPU probe (`wzlrvklfqjn78v`) — attempted, not measured
-
-- **Provisioned:** 4× RTX 4090 community pod (~$1.36/hr); `nvidia-smi` saw all four GPUs (PCIe Gen1 ×16; mixed SYS/NODE topology across sockets).
-- **Blocker:** PyTorch `2.8.0+cu128` failed CUDA context init (`CUDA unknown error`) while the driver reported CUDA 13.2 — `torch.cuda.is_available() == False` despite `device_count() == 4`. No trustworthy 4-GPU tok/s were collected; pod deleted after diagnosis.
-- Multi-node Instant Clusters were **not** used in this pass (stock / scope); scale-out remains a follow-up, not invented.
-
----
-
-## 3. Workload definition
-
-**Default engineering model** (suite cases unless noted):
-
-| Knob | Value |
+| Axis | What we ran |
 |---|---|
-| hidden / layers / heads | 1024 / 12 / 16 |
-| seq / batch / vocab | 512 / 2 / 8192 |
-| params (DP replica) | ~160.1M |
-| params (TP=2 shard) | ~84.5M |
-| dataset | WikiText-2 |
-| steps / warmup discard | 30–40 / 3 |
+| Model | **Base ~160M** and **XL ~479M** |
+| Data | **WikiText-2** and **WikiText-103** (HF parquet → packed LM stream) |
+| Hardware | RunPod **2×RTX 4090** (base) and **2×A100 80GB PCIe** (XL) |
+| Analysis | Suite summary + pairwise/relative `suite_analysis` |
 
-**Token accounting:** global tok/s scales with **DP size only** (not TP/PP). For PP, tokens per optimizer step include `num_microbatches × batch × seq`.
+**Headline (XL / 2×A100 / WikiText-103):** TP≈ matches 1-GPU; **overlap +6.3%**; DDP-2 still regresses on PCIe; SP overhead shrinks vs the small-model suite; **PP completes** on the reduced schedule.
 
 ---
 
-## 4. Primary 2-GPU results (WikiText-2, eng model)
+## 2. Implementation map (by technique)
 
-Throughput table (exclude `*_profiled`):
+| Technique | Role in the engine | Key code / docs |
+|---|---|---|
+| **DDP** | Replicate model; AllReduce grads; tokens scale with DP | `distributed.py`, RFC-001 |
+| **TP** | Shard Column/Row linears; AG/RS/AR on activations | `layers.py`, `mappings.py`, RFC-002 |
+| **DP×TP** | 2D groups: `rank = dp*(pp*tp)+…` | `parallel_state.py`, RFC-003 |
+| **PP** | Layer split + educational **1F1B** async P2P | `pipeline.py`, RFC-004 |
+| **Checkpoint** | Step dirs, TP reshard, resume | `checkpoint.py`, RFC-005 |
+| **Profiler** | Named ranges + Chrome traces (`--profile-dir`) | `profiler.py`, RFC-006 |
+| **Overlap** | Async ColumnParallel bwd + delayed RowParallel wait | `overlap.py`, RFC-007/008 |
+| **SP / VP** | Sequence shard for LN/dropout; vocab-parallel CE | RFC-009, Phase 9 docs |
 
-| case | dp/tp/pp | flags | step ms | tok/s | loss | notes |
-|---|---|---|---:|---:|---:|---|
-| gpu1_ddp | 1/1/1 | — | 56.08 | **18289** | 6.6205 | single-GPU baseline |
-| gpu2_ddp | 2/1/1 | — | 215.36 | **9535** | 6.6642 | DDP regresses vs 1 GPU |
-| gpu2_tp | 1/2/1 | — | 89.50 | **11446** | 6.6588 | best 2-GPU eng config here |
-| gpu2_tp_overlap | 1/2/1 | overlap | 90.28 | **11342** | 6.6588 | ≈ flat vs sync |
-| gpu2_tp_sp | 1/2/1 | SP | 109.67 | **9337** | 6.6881 | SP overhead |
-| gpu2_tp_sp_vp | 1/2/1 | SP+VP | 110.57 | **9262** | 6.6532 | VP ≈ neutral on top of SP |
-
-Raw JSON: [`docs/experiments/engineering_suite/`](../experiments/engineering_suite/).
-
-### Phase-8 overlap reference (earlier RunPod pair, random/smaller schedule)
-
-On a prior 2×4090 measurement (`docs/experiments/phase8-runpod-overlap-results.md`):
-
-- hidden=1024, batch=4, seq=512, layers=8: overlap **+4.2%** tok/s vs sync  
-- hidden=2048, batch=2: overlap **−2.9%** (noise / not enough GEMM to hide NCCL)
-
-Engineering-suite eng model (batch=2) sits in the “overlap ≈ flat” regime, consistent with that second point.
+Harness: `scripts/benchmark_engineering_suite.sh`, `scripts/benchmark_engineering_xl.sh`, `scripts/analyze_engineering_suite.py`.
 
 ---
 
-## 5. Analysis by technology
+## 3. Workloads
+
+### Suite A — Base (2×4090)
+
+- Model: h=1024, L=12, heads=16, seq=512, batch=2, vocab=8192 → **~160.1M** params (TP shard ~84.5M)
+- Data: WikiText-2  
+- Commit: `331308d` / PP follow-ups `5f28bd8`  
+- Host: NODE topology, no NVLink (PCIe)
+
+Artifacts: [`docs/experiments/engineering_suite/`](../experiments/engineering_suite/)
+
+### Suite B — XL (2×A100 80GB PCIe)
+
+- Model: h=1536, L=16, heads=16, seq=512, batch=1, vocab=16384 → **~479.3M** params  
+- Data: **WikiText-103** (Salesforce HF parquet shards converted to `wiki.train.raw`)  
+- Commit: `a9879e3`  
+- Host: PHB topology, PCIe Gen4×16
+
+Artifacts: [`docs/experiments/engineering_suite_xl/`](../experiments/engineering_suite_xl/)
+
+---
+
+## 4. Measured results
+
+### 4.1 Suite A — 2×4090 / WikiText-2 / ~160M
+
+| case | dp/tp/pp | tok/s | vs 1-GPU | bwd share of step | note |
+|---|---|---:|---:|---:|---|
+| gpu1_ddp | 1/1/1 | **18289** | 1.00× | 47% | baseline |
+| gpu2_ddp | 2/1/1 | **9535** | 0.52× | **87%** | AllReduce-bound |
+| gpu2_tp | 1/2/1 | **11446** | 0.63× | 48% | best 2-GPU eng |
+| gpu2_tp_overlap | 1/2/1 | **11342** | 0.62× | 48% | ≈ flat (−0.9%) |
+| gpu2_tp_sp | 1/2/1 | **9337** | 0.51× | 49% | SP −18% vs TP |
+| gpu2_tp_sp_vp | 1/2/1 | **9262** | 0.51× | 49% | VP ≈ neutral |
+
+PP eng-seq hung on this NODE/PCIe box; mid/reduced PP JSON recorded separately (`gpu2_pp_mid`, `gpu2_pp_reduced`).
+
+Prior Phase-8 overlap reference (same class of 4090s, different schedule): **+4.2%** at batch=4 / h=1024; **−2.9%** at h=2048 batch=2 — see `docs/experiments/phase8-runpod-overlap-results.md`.
+
+### 4.2 Suite B — 2×A100 / WikiText-103 / ~479M
+
+| case | dp/tp/pp | tok/s | vs 1-GPU | bwd share | note |
+|---|---|---:|---:|---:|---|
+| gpu1_ddp | 1/1/1 | **3837** | 1.00× | 53% | XL single-GPU |
+| gpu2_ddp | 2/1/1 | **2029** | 0.53× | **88%** | still AllReduce-bound |
+| gpu2_tp | 1/2/1 | **4051** | **1.06×** | 52% | TP beats 1-GPU |
+| gpu2_tp_overlap | 1/2/1 | **4306** | **1.12×** | 48% | **+6.3% vs sync TP** |
+| gpu2_tp_sp | 1/2/1 | **3786** | 0.99× | 52% | SP −6.5% vs TP |
+| gpu2_tp_sp_vp | 1/2/1 | **3859** | 1.01× | 52% | VP +1.9% on SP |
+| gpu2_pp | 1/1/2 | **5493** | 1.43×* | n/a† | reduced seq/mb schedule |
+
+\*PP uses `seq=256`, `batch=1`, `num_microbatches=2` (suite default for stability); not identical to TP schedule.  
+†PP timer currently folds schedule into forward (`bwd_ms=0`); use step time / tok/s.
+
+---
+
+## 5. Analysis by technique
 
 ### 5.1 DDP
 
-**What it does:** Replicate the full model; AllReduce grads each step; scale tokens with DP.
+On **both** measured fabrics (4090 NODE and A100 PHB), 1→2 DDP **halves** global tok/s while backward becomes ~87–88% of the step. Gradient AllReduce volume dominates when interconnect is PCIe and the model is not huge enough to amortize it.
 
-**Observation:** 1→2 GPU **halved** global tok/s (18289 → 9535). Forward stayed ~13 ms; **backward exploded** 26.6 → 186.8 ms — classic AllReduce-dominated step on a weak GPU–GPU path (NODE / no NVLink).
+**Interview takeaway:** DDP scaling is an interconnect story first; weak multi-GPU PCIe hosts are excellent demos of *negative* scaling.
 
-**Takeaway:** DDP only wins when interconnect bandwidth ≫ gradient volume / step, or when per-GPU compute is large enough to amortize AllReduce. On this box, DDP-2 is a negative scaling demo — valuable for interviews, not a failure of the code path.
+### 5.2 Tensor Parallel
 
-### 5.2 Tensor Parallel (TP)
-
-**What it does:** Shard Column/Row linear weights; AllGather / ReduceScatter / AllReduce on activations/grads; memory per rank ≈ 1/TP.
-
-**Observation:** TP=2 beats DDP=2 here (11446 vs 9535 tok/s) despite more frequent collectives: less activation memory traffic than full-grad AllReduce on this interconnect, and half the params per GPU (~84.5M).
-
-**Takeaway:** Prefer TP over DP when model memory or slow AllReduce dominates and TP degree matches hidden/head divisibility.
+TP shards parameters (~½ memory) and replaces one large grad AllReduce with finer activation collectives. On 4090s TP beats DDP-2; on A100 XL, TP **slightly exceeds** 1-GPU tok/s (1.06×) because memory traffic / optimizer cost per rank drops.
 
 ### 5.3 Communication overlap
 
-**What it does:** Async TP collectives overlapped with independent GEMM (ColumnParallel bwd; delayed RowParallel forward wait).
+Overlap is **workload-dependent**:
 
-**Observation:** Eng suite overlap ≈ sync (−0.9%). Earlier suite showed +4.2% when batch/compute was larger.
+- Base eng (batch=2, ~160M, 4090): **−0.9%** (noise / not enough GEMM to hide NCCL)
+- Phase-8 batch=4: **+4.2%**
+- XL (~479M, A100): **+6.3%** with identical loss vs sync TP
 
-**Takeaway:** Overlap is workload-sensitive; publish both sync and overlap; never claim universal speedups.
+Larger compute intensity makes delayed waits and async ColumnParallel bwd pay off.
 
-### 5.4 Sequence Parallel (SP) & Vocab Parallel (VP)
+### 5.4 Sequence / Vocab Parallel
 
-**What it does:** SP shards sequence for LayerNorm/dropout regions (AG before TP compute, RS after); VP shards embedding/LM-head vocab + vocab-parallel cross-entropy.
+SP adds AG/RS around non-TP regions. Overhead fell from **−18%** (base/4090) to **−6.5%** (XL/A100) — more compute hides collectives. VP on top is roughly neutral (+1.9% here) while cutting vocab-layer memory.
 
-**Observation:** SP (−18% vs TP) and SP+VP (−19%) add collective volume; on this eng workload the extra AG/RS is not hidden. Memory/params drop slightly with VP (~80.3M vs ~84.5M).
+### 5.5 Pipeline Parallel
 
-**Takeaway:** SP/VP are correctness + memory tools first; throughput wins appear at longer sequences / larger hidden where activation memory binds.
-
-### 5.5 Pipeline Parallel (PP)
-
-**What it does:** Split layers across stages; 1F1B with async P2P activations/grads; microbatching.
-
-**Bugs fixed during this pass:** `PipelineEngine` / `MicrobatchIO` imports were dropped by the Phase-6 profiler commit — restored in `352d3c9` / `5f28bd8`.
-
-**Eng-default hang:** `seq=512, batch=2, hidden=1024, layers=12, mb=4` **does not complete** on this NODE/PCIe host (NCCL P2P and `NCCL_P2P_DISABLE=1` both stall past multi-minute timeouts). Smaller PP configs complete:
-
-| case | config delta | step ms | tok/s | loss |
-|---|---|---:|---:|---:|
-| gpu2_pp_mid | h512 L8 seq256 mb4 | 68.21 | 30027 | 6.8547 |
-| gpu2_pp_reduced | h1024 L12 seq256 bs1 mb2 | 51.23 | 9997 | 6.6826 |
-
-**Instrumentation note:** PP path currently reports `avg_backward_ms=0` (fwd timer wraps schedule); use step time / tok/s, not bwd split, for PP.
-
-**Takeaway:** PP is functionally validated (unit tests + mid/reduced GPU runs). Full eng-seq PP on consumer PCIe pairs needs better fabric or further schedule/memory hardening — documented honestly rather than fabricated.
+1F1B with async P2P is functionally correct (unit tests + GPU runs). Eng-default `seq=512/batch=2/mb=4` stalled on weak 4090 NODE links; **A100 suite `gpu2_pp` completed** with the reduced schedule. PP tok/s is not apples-to-apples with TP rows (different microbatching).
 
 ### 5.6 Profiler
 
-Chrome traces under `profile_tp*` show `tp_all_reduce` / matmul ranges. Profiled JSON steps are **600+ ms** — exclude from throughput tables.
+`--profile-dir` runs inflate step time (XL profiled ~913 ms vs ~126 ms). Use traces qualitatively (`tp_all_reduce`, matmuls); never publish profiled tok/s.
 
-### 5.7 Dataset & model scale
+### 5.7 Data & model scale
 
-WikiText-2 replaces pure random tokens for realistic vocab / loss curves. Eng model (~160M) is large enough to stress TP memory sharding and expose interconnect effects without requiring multi-node H100 stock.
-
----
-
-## 6. Cross-strategy comparison (same host)
-
-Relative to **gpu1_ddp** tok/s (=1.00×):
-
-| strategy | relative tok/s | verdict on this host |
-|---|---:|---|
-| 1× DDP | 1.00× | baseline |
-| 2× DDP | 0.52× | negative scaling (AllReduce) |
-| 2× TP | 0.63× | best multi-GPU eng option here |
-| 2× TP+overlap | 0.62× | ≈ TP |
-| 2× TP+SP | 0.51× | memory/correctness path |
-| 2× TP+SP+VP | 0.51× | same + vocab shard |
-
-PP numbers are **not** on the identical seq/batch schedule; compare PP only within `gpu2_pp_*` rows.
+- **WikiText-2**: small, fast, good for CI-like GPU loops.  
+- **WikiText-103**: ~300MB parquet → large packed stream; exercises real vocab skew / longer epochs.  
+- **XL ~479M**: enough to show overlap wins and keep TP memory comfortable on 80GB with batch=1.
 
 ---
 
-## 7. Limitations (explicit)
+## 6. Larger distributed systems (GPU count / multi-node)
 
-1. **Single-node only** in completed measurements; multi-node not stocked for Instant Clusters in this pass.  
-2. **No NVLink** on measured 4090 pairs — numbers are interconnect-bound.  
-3. **Eng-default PP** hangs on this fabric; mid/reduced PP used instead.  
-4. **4×4090 pod** was rented but unusable for PyTorch (CUDA init failure); no 4-GPU numbers are claimed.  
-5. Profiled tok/s must never be cited as performance.
+| Attempt | Outcome |
+|---|---|
+| 4×4090 (earlier) | Pod up; `nvidia-smi` OK; **PyTorch CUDA init failed** (driver/CUDA mismatch). No numbers claimed. |
+| 4×4090 (retry) | **No stock** |
+| 2×4090 (XL retry) | Stuck without published SSH port 22 → deleted |
+| 2×A100 | **Success** — full XL matrix |
+| Multi-node Instant Cluster | Launcher exists (`scripts/runpod/run_ddp_multinode.sh`); **not stocked / not executed** this pass |
+
+We do **not** invent multi-node or 4-GPU tok/s. The multinode script is ready when a cluster provides `MASTER_ADDR` / `NUM_NODES` / `NODE_RANK`.
 
 ---
 
-## 8. How to reproduce
+## 7. Comparative takeaways
+
+1. **Prefer TP over DP** on PCIe-only multi-GPU boxes for this model class.  
+2. **Enable overlap** when GEMM is large enough (XL showed +6.3%; tiny batches may regress).  
+3. **SP/VP** are primarily memory/correctness features; throughput cost shrinks as the model grows.  
+4. **PP** needs adequate P2P bandwidth or reduced microbatch shapes on consumer fabrics.  
+5. **Profiler** is for communication/compute timelines, not for published throughput.
+
+---
+
+## 8. Reproduce
 
 ```bash
-# On a multi-GPU RunPod image with this branch checked out:
-./scripts/runpod/bootstrap.sh   # if present
-GPU_COUNT=2 PROFILE=1 OUT_DIR=results/engineering_suite \
-  ./scripts/benchmark_engineering_suite.sh
+# Base suite (WikiText-2, ~160M)
+./scripts/runpod/bootstrap.sh
+GPU_COUNT=2 PROFILE=0 ./scripts/benchmark_engineering_suite.sh
 
-# Overlap-focused (Phase 8):
-OUT_DIR=results/phase8_overlap ./scripts/benchmark_tp_overlap.sh
+# XL suite (WikiText-103, ~479M)
+SCALE=xl DATASET=wikitext103 GPU_COUNT=2 PROFILE=1 \
+  ./scripts/benchmark_engineering_xl.sh
 ```
 
-Summarize: `python3 scripts/summarize_engineering_suite.py results/engineering_suite`
+Analysis: `python3 scripts/analyze_engineering_suite.py <out_dir>`
 
 ---
 
-## 9. Per-phase technical map
+## 9. Limitations
 
-| Phase | Doc / RFC | Core code |
-|---|---|---|
-| 1 DDP | `docs/phase1-*`, RFC-001 | `distributed.py`, `train.py` |
-| 2 TP | `docs/phase2-*`, RFC-002 | `layers.py`, `mappings.py` |
-| 3 DP×TP | `docs/phase3-*`, RFC-003 | `parallel_state.py` |
-| 4 PP | `docs/phase4-*`, RFC-004 | `pipeline.py` |
-| 5 CKPT | `docs/phase5-*`, RFC-005 | `checkpoint.py` |
-| 6 Profiler | `docs/phase6-*`, RFC-006 | `profiler.py` |
-| 7 Overlap | `docs/phase7-*`, RFC-007 | `overlap.py` + ColumnParallel |
-| 8 Delayed Row wait | `docs/phase8-*`, RFC-008 | pending AllReduce queue |
-| 9 SP/VP | `docs/phase9-*`, RFC-009 | SP mappings, vocab CE |
+1. Single-node measurements only (2 GPUs).  
+2. No NVLink on measured hosts.  
+3. 4-GPU / multi-node not successfully measured (stock or CUDA/SSH blockers).  
+4. PP suite shape differs from TP rows by design (stability).  
+5. WikiText-103 packing uses a char budget (~80M) so the id tensor fits in RAM — still far larger than WikiText-2.
 
 ---
 
 ## 10. Conclusion
 
-The mini engine implements the interview-relevant parallel stack (DDP, TP, DP×TP, PP 1F1B, checkpoint, profiler, overlap, SP/VP) with a real WikiText-2 path and a unified GPU harness. On commodity 2×4090 PCIe hosts, **TP outperforms DDP**, **overlap is workload-dependent**, and **SP/VP trade throughput for activation/vocab memory**. PP works at moderated shapes; eng-seq PP on this fabric is a known open risk called out with measurements, not placeholders.
-
-Artifact index: `docs/experiments/engineering_suite/`, `docs/experiments/phase8-runpod-overlap-results.md`, this report.
+The engine covers the parallel-training technique stack expected in AI Infra interviews, validated on **real RunPod GPUs** with **two model scales** and **two real corpora**. The data show when each knob helps (TP + overlap on XL/A100) and when the fabric dominates (DDP on PCIe). Artifacts and pairwise analysis live under `docs/experiments/engineering_suite*` for audit.
