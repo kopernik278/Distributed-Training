@@ -47,6 +47,7 @@ from .parallel_state import (
     initialize_model_parallel,
 )
 from .overlap import set_overlap_enabled
+from .pipeline import PipelineEngine
 from .profiler import maybe_profile, profiler_step, record_range
 
 
