@@ -9,6 +9,7 @@ description = "Phase 1 of a mini distributed LLM training engine"
 requires-python = ">=3.10"
 dependencies = [
   "torch",
+  "pyarrow",
 ]
 
 [tool.setuptools]

@@ -29,6 +29,7 @@ echo "[bootstrap] python: ${PYTHON_BIN} ($("${PYTHON_BIN}" --version))"
 
 "${PIP_BIN}" install -U pip
 "${PIP_BIN}" install -e .
+"${PIP_BIN}" install -q pyarrow
 
 mkdir -p results profiles checkpoints configs
 

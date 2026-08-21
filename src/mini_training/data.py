@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import re
 import urllib.request
-import zipfile
 from pathlib import Path
 
 import torch
@@ -15,10 +14,10 @@ _WIKITEXT2_BASE = (
 )
 _WIKITEXT2_FILES = ("train.txt", "valid.txt", "test.txt")
 
-# WikiText-103 raw (Salesforce / HuggingFace mirrors). Prefer zip of raw files.
-_WIKITEXT103_ZIP_URLS = (
-    "https://huggingface.co/datasets/Salesforce/wikitext/resolve/main/wikitext-103-raw-v1.zip",
-    "https://smerity.com/static/datasets/wikitext/wikitext-103-raw-v1.zip",
+# WikiText-103 is published on HuggingFace as parquet shards (text column).
+_WIKITEXT103_PARQUET_URLS = (
+    "https://huggingface.co/datasets/Salesforce/wikitext/resolve/main/wikitext-103-raw-v1/train-00000-of-00002.parquet",
+    "https://huggingface.co/datasets/Salesforce/wikitext/resolve/main/wikitext-103-raw-v1/train-00001-of-00002.parquet",
 )
 
 
@@ -103,44 +102,44 @@ def ensure_wikitext2(data_dir: str | Path) -> Path:
 
 
 def ensure_wikitext103(data_dir: str | Path) -> Path:
-    """Download WikiText-103-raw train split; return path to ``wiki.train.raw``."""
+    """Download WikiText-103-raw train text; return path to ``wiki.train.raw``."""
     root = Path(data_dir) / "wikitext-103-raw"
     train_path = root / "wiki.train.raw"
     if train_path.is_file() and train_path.stat().st_size > 0:
         return train_path
 
     root.mkdir(parents=True, exist_ok=True)
-    zip_path = root / "wikitext-103-raw-v1.zip"
-    if not zip_path.is_file() or zip_path.stat().st_size < 1_000_000:
-        last_err: Exception | None = None
-        for url in _WIKITEXT103_ZIP_URLS:
-            try:
-                _download(url, zip_path)
-                last_err = None
-                break
-            except Exception as exc:  # noqa: BLE001
-                last_err = exc
-                print(f"[data] mirror failed: {url} ({exc})")
-        if last_err is not None and (not zip_path.is_file() or zip_path.stat().st_size < 1_000_000):
-            raise RuntimeError(f"failed to download WikiText-103: {last_err}") from last_err
+    parquet_dir = root / "parquet"
+    parquet_dir.mkdir(parents=True, exist_ok=True)
+    local_parts: list[Path] = []
+    for url in _WIKITEXT103_PARQUET_URLS:
+        name = url.rsplit("/", 1)[-1]
+        dest = parquet_dir / name
+        if not dest.is_file() or dest.stat().st_size < 1_000_000:
+            _download(url, dest)
+        local_parts.append(dest)
 
-    print(f"[data] extracting {zip_path}")
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        train_member = None
-        for name in zf.namelist():
-            if name.endswith("wiki.train.raw"):
-                train_member = name
-                break
-        if train_member is None:
-            raise FileNotFoundError("wiki.train.raw not found inside WikiText-103 zip")
-        with zf.open(train_member) as src, train_path.open("wb") as dst:
-            while True:
-                chunk = src.read(1 << 20)
-                if not chunk:
-                    break
-                dst.write(chunk)
+    try:
+        import pyarrow.parquet as pq
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError(
+            "WikiText-103 download requires pyarrow; pip install pyarrow"
+        ) from exc
+
+    print(f"[data] converting {len(local_parts)} parquet shards → {train_path}")
+    with train_path.open("w", encoding="utf-8") as out:
+        for part in local_parts:
+            table = pq.read_table(part, columns=["text"])
+            for value in table.column("text").to_pylist():
+                if not value:
+                    continue
+                text = str(value).strip()
+                if not text:
+                    continue
+                out.write(text)
+                out.write("\n")
     if not train_path.is_file() or train_path.stat().st_size == 0:
-        raise FileNotFoundError(f"expected {train_path} after extracting WikiText-103")
+        raise FileNotFoundError(f"expected {train_path} after converting WikiText-103")
     return train_path
 
 
@@ -226,7 +225,7 @@ class PackedTextDataset:
 
         pack_limit = max_pack_chars
         if pack_limit is None and "103" in corpus.replace("-", ""):
-            # ~80M chars ≈ enough for long throughput runs without multi-GB tensors.
+            # Enough tokens for long throughput runs without multi-GB id tensors.
             pack_limit = 80_000_000
 
         ids: list[int] = []
@@ -273,8 +272,9 @@ class PackedTextDataset:
         return inputs, targets
 
 
-# Back-compat alias used by tests / train typing.
 class WikiText2Dataset(PackedTextDataset):
+    """Back-compat alias for WikiText-2 packed LM stream."""
+
     def __init__(
         self,
         config: TrainingConfig,
