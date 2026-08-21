@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 import torch.distributed as dist
 
+from .overlap import async_tp_all_reduce, wait_tp_all_reduce
 from .parallel_state import (
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
@@ -48,8 +49,8 @@ def _gather_along_last_dim(input_: torch.Tensor) -> torch.Tensor:
 def _reduce(input_: torch.Tensor) -> torch.Tensor:
     if _tp_size() == 1:
         return input_
-    with record_range("tp_all_reduce"):
-        dist.all_reduce(input_, op=dist.ReduceOp.SUM, group=_tp_group())
+    work = async_tp_all_reduce(input_)
+    wait_tp_all_reduce(work, input_)
     return input_
 
 

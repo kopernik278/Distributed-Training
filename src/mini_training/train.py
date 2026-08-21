@@ -41,7 +41,7 @@ from .parallel_state import (
     get_tensor_model_parallel_world_size,
     initialize_model_parallel,
 )
-from .profiler import maybe_profile, profiler_step, record_range
+from .overlap import set_overlap_enabled
 
 
 def parse_args() -> argparse.Namespace:
@@ -105,6 +105,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--profile-wait", type=int, default=1, help="Profiler: steps to skip before warmup")
     parser.add_argument("--profile-warmup", type=int, default=1, help="Profiler: warmup steps")
     parser.add_argument("--profile-active", type=int, default=2, help="Profiler: recorded steps")
+    parser.add_argument(
+        "--overlap",
+        action="store_true",
+        help="Overlap TP AllReduce(dX) with dW GEMM; enable DDP bucket overlap knobs",
+    )
+    parser.add_argument(
+        "--ddp-bucket-cap-mb",
+        type=float,
+        default=25.0,
+        help="DDP gradient bucket size in MiB (smaller ⇒ more overlap chances, more launch overhead)",
+    )
     return parser.parse_args()
 
 
@@ -136,6 +147,8 @@ def build_config(args: argparse.Namespace) -> TrainingConfig:
         num_microbatches=num_microbatches,
         data_parallel_size=args.data_parallel_size,
         log_interval=args.log_interval,
+        overlap=bool(args.overlap),
+        ddp_bucket_cap_mb=float(args.ddp_bucket_cap_mb),
     )
 
 
@@ -236,15 +249,17 @@ def validate_parallel_sizes(world_size: int, config: TrainingConfig) -> int:
     return inferred_dp
 
 
-def _wrap_ddp(model: torch.nn.Module, device: torch.device) -> torch.nn.Module:
+def _wrap_ddp(model: torch.nn.Module, device: torch.device, config: TrainingConfig) -> torch.nn.Module:
     if not (is_distributed() and get_data_parallel_world_size() > 1):
         return model
-    ddp_kwargs = {
-        "device_ids": [device.index] if device.type == "cuda" else None,
+    ddp_kwargs: dict[str, object] = {
         "process_group": get_data_parallel_group(),
+        "broadcast_buffers": False,
+        "gradient_as_bucket_view": True,
+        "bucket_cap_mb": config.ddp_bucket_cap_mb,
     }
-    if ddp_kwargs["device_ids"] is None:
-        ddp_kwargs.pop("device_ids")
+    if device.type == "cuda" and device.index is not None:
+        ddp_kwargs["device_ids"] = [device.index]
     return DDP(model, **ddp_kwargs)
 
 
@@ -317,6 +332,7 @@ def main() -> None:
         tensor_model_parallel_size=config.tensor_parallel_size,
         pipeline_model_parallel_size=config.pipeline_parallel_size,
     )
+    set_overlap_enabled(config.overlap)
     if get_data_parallel_world_size() != inferred_dp:
         raise RuntimeError(
             f"parallel_state dp_size={get_data_parallel_world_size()} != inferred {inferred_dp}"
@@ -332,7 +348,7 @@ def main() -> None:
         model = MiniTransformerLM(config).to(device)
     broadcast_parameters_within_dp(model)
     parameter_count = model_parameter_count(model)
-    model = _wrap_ddp(model, device)
+    model = _wrap_ddp(model, device, config)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
 

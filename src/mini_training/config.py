@@ -26,6 +26,8 @@ class TrainingConfig:
     num_microbatches: int = 1
     # Optional explicit DP size. When None, inferred as world_size // (pp * tp).
     data_parallel_size: int | None = None
+    overlap: bool = False
+    ddp_bucket_cap_mb: float = 25.0
 
     @property
     def tokens_per_step_per_rank(self) -> int:

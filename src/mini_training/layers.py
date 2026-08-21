@@ -7,11 +7,11 @@ from torch import nn
 import torch.nn.functional as F
 
 from .mappings import (
-    copy_to_tensor_model_parallel_region,
     gather_from_tensor_model_parallel_region,
     reduce_from_tensor_model_parallel_region,
     scatter_to_tensor_model_parallel_region,
 )
+from .overlap import async_tp_all_reduce, wait_tp_all_reduce
 from .parallel_state import (
     get_tensor_model_parallel_world_size,
 )
@@ -20,6 +20,41 @@ from .parallel_state import (
 def _set_tensor_parallel_attributes(tensor: torch.Tensor, partition_dim: int) -> None:
     setattr(tensor, "tensor_model_parallel", True)
     setattr(tensor, "partition_dim", int(partition_dim))
+
+
+class _ColumnParallelLinearFn(torch.autograd.Function):
+    """Y = X W^T + b with TP input-grad AllReduce.
+
+    Backward overlap (when enabled): AllReduce(dX) runs while dW GEMM computes.
+    """
+
+    @staticmethod
+    def forward(ctx, input_: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None):  # type: ignore[override]
+        ctx.save_for_backward(input_, weight, bias)
+        ctx.has_bias = bias is not None
+        return F.linear(input_, weight, bias)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):  # type: ignore[override]
+        input_, weight, bias = ctx.saved_tensors
+        grad_output = grad_output.contiguous()
+        input_2d = input_.reshape(-1, input_.shape[-1])
+        grad_output_2d = grad_output.reshape(-1, grad_output.shape[-1])
+
+        # dX_local = dY @ W   (needs AllReduce across TP; independent of dW)
+        grad_input_2d = grad_output_2d.matmul(weight)
+        work = async_tp_all_reduce(grad_input_2d)
+
+        # dW = dY^T @ X  — independent of reduced dX, so this is the overlap window
+        # when AllReduce was launched asynchronously.
+        grad_weight = grad_output_2d.t().matmul(input_2d)
+        grad_bias = None
+        if ctx.has_bias:
+            grad_bias = grad_output_2d.sum(dim=0)
+
+        wait_tp_all_reduce(work, grad_input_2d)
+        grad_input = grad_input_2d.view_as(input_)
+        return grad_input, grad_weight, grad_bias
 
 
 class ColumnParallelLinear(nn.Module):
@@ -64,8 +99,12 @@ class ColumnParallelLinear(nn.Module):
             nn.init.zeros_(self.bias)
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
-        input_parallel = copy_to_tensor_model_parallel_region(input_)
-        output_parallel = F.linear(input_parallel, self.weight, self.bias)
+        # Fused linear + input-grad AllReduce so backward can overlap comm with dW GEMM.
+        output_parallel = _ColumnParallelLinearFn.apply(
+            input_,
+            self.weight,
+            self.bias if self.bias is not None else None,
+        )
         if self.gather_output:
             return gather_from_tensor_model_parallel_region(output_parallel)
         return output_parallel

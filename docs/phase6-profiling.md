@@ -30,7 +30,9 @@ BACKEND=nccl ./scripts/run_tp.sh 2 --steps 8 ... --profile-dir profiles/tp2
 
 Look for `tp_all_reduce` next to `aten::mm`. Sequential bars ⇒ no overlap yet.
 
+Phase 7 implements opt-in overlap: `docs/phase7-comm-overlap.md`.
+
 ## Next
 
-- Overlap communication with compute (DDP buckets / TP stream)
+- Delayed wait for RowParallel forward AllReduce
 - Optional Nsight Systems on RunPod

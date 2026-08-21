@@ -137,6 +137,59 @@ def _tp2_worker(rank: int, world_size: int, result_queue) -> None:
     dist.destroy_process_group()
 
 
+def _tp2_overlap_worker(rank: int, world_size: int, result_queue) -> None:
+    """Same MLP as _tp2_worker but with comm/compute overlap enabled; compare grads to sync path."""
+    from mini_training.overlap import set_overlap_enabled
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = "29533"
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
+    destroy_model_parallel()
+    initialize_model_parallel(tensor_model_parallel_size=2)
+
+    torch.manual_seed(123)
+    dense1 = nn.Linear(8, 16)
+    dense2 = nn.Linear(16, 8)
+    torch.manual_seed(123)
+    dense1.reset_parameters()
+    dense2.reset_parameters()
+    for tensor in list(dense1.parameters()) + list(dense2.parameters()):
+        dist.broadcast(tensor.data, src=0)
+
+    x = torch.randn(2, 3, 8)
+    dist.broadcast(x, src=0)
+
+    def _build_tp():
+        col = ColumnParallelLinear(8, 16, bias=True, gather_output=False)
+        row = RowParallelLinear(16, 8, bias=True, input_is_parallel=True)
+        with torch.no_grad():
+            col.weight.copy_(shard_column_weight(dense1.weight.data, rank, 2))
+            col.bias.copy_(dense1.bias.data[rank * 8 : (rank + 1) * 8])
+            row.weight.copy_(shard_row_weight(dense2.weight.data, rank, 2))
+            row.bias.copy_(dense2.bias.data)
+        return col, row
+
+    set_overlap_enabled(False)
+    col_sync, row_sync = _build_tp()
+    y_sync = row_sync(torch.nn.functional.gelu(col_sync(x.clone())))
+    y_sync.square().mean().backward()
+
+    set_overlap_enabled(True)
+    col_ov, row_ov = _build_tp()
+    y_ov = row_ov(torch.nn.functional.gelu(col_ov(x.clone())))
+    y_ov.square().mean().backward()
+
+    y_err = (y_sync.detach() - y_ov.detach()).abs().max().item()
+    w_err = (col_sync.weight.grad - col_ov.weight.grad).abs().max().item()
+    x_err = 0.0
+    set_overlap_enabled(False)
+    result_queue.put((rank, y_err, w_err, x_err))
+    destroy_model_parallel()
+    dist.destroy_process_group()
+
+
 class TensorParallelMultiProcessTests(unittest.TestCase):
     def test_column_row_mlp_matches_dense_tp2(self) -> None:
         import torch.multiprocessing as mp
@@ -159,6 +212,27 @@ class TensorParallelMultiProcessTests(unittest.TestCase):
             self.assertLess(max_err, 1e-4, msg=f"rank {rank} max_err={max_err}")
             self.assertTrue(col_grad)
             self.assertTrue(row_grad)
+
+    def test_overlap_matches_sync_tp2(self) -> None:
+        import torch.multiprocessing as mp
+
+        world_size = 2
+        ctx = mp.get_context("spawn")
+        result_queue = ctx.SimpleQueue()
+        processes = []
+        for rank in range(world_size):
+            process = ctx.Process(target=_tp2_overlap_worker, args=(rank, world_size, result_queue))
+            process.start()
+            processes.append(process)
+
+        results = [result_queue.get() for _ in range(world_size)]
+        for process in processes:
+            process.join(timeout=120)
+            self.assertEqual(process.exitcode, 0)
+
+        for rank, y_err, w_err, _x_err in results:
+            self.assertLess(y_err, 1e-5, msg=f"rank {rank} y_err={y_err}")
+            self.assertLess(w_err, 1e-5, msg=f"rank {rank} w_err={w_err}")
 
 
 if __name__ == "__main__":

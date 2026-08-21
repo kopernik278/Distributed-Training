@@ -126,17 +126,20 @@ Save **unique** pieces (`dp_rank==0` only). File name encodes `pp` and `tp`.
 
 ---
 
-## 7. Phase 6 — Profiling (this milestone)
+## 7. Phase 6–7 — Profiling then overlap
 
-A profiler is a labeled stopwatch. We export a Chrome trace:
+Profiler = labeled stopwatch (Chrome trace). Overlap = hide AllReduce behind a GEMM that
+does not need the AllReduce result.
 
-1. Run with `--profile-dir profiles/demo`
-2. Open `profiles/demo/rank0.json` in [Perfetto](https://ui.perfetto.dev)
-3. Look for `train_step`, `tp_all_reduce`, `pp_send`, vs `aten::mm`
+ColumnParallel backward:
 
-**Overlap** means a communication bar sits *under* a compute bar on the same GPU timeline. If they are strictly sequential, the GPU waited. We instrument first; hiding comm behind compute is the next optimization.
+```text
+dX_local = dY @ W     → start AllReduce(dX)
+dW = X^T @ dY         → can run at the same time
+then wait for AllReduce
+```
 
-**Do not publish tokens/s from profiled runs.** Profiler overhead is large.
+Turn on with `--overlap`. Tiny CPU models will not get faster; this is a GPU pattern.
 
 ---
 
