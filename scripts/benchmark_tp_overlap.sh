@@ -3,14 +3,14 @@ set -euo pipefail
 
 # Compare TP training with and without --overlap on the same machine.
 # Designed for RunPod multi-GPU (NCCL). Never invents numbers — only records
-# what train.py prints / writes.
+# what train.py writes via --metrics-path.
 #
 # Usage:
 #   ./scripts/benchmark_tp_overlap.sh
 #   OUT_DIR=results/phase8_overlap TP_SIZE=2 ./scripts/benchmark_tp_overlap.sh
 #
 # Optional env overrides:
-#   TP_SIZE HIDDEN LAYERS HEADS BATCH SEQ STEPS WARMUP PROFILE_STEPS
+#   TP_SIZE HIDDEN LAYERS HEADS BATCH SEQ STEPS PROFILE_STEPS
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
@@ -31,13 +31,11 @@ HEADS="${HEADS:-16}"
 BATCH="${BATCH:-4}"
 SEQ="${SEQ:-512}"
 STEPS="${STEPS:-30}"
-WARMUP="${WARMUP:-3}"
 PROFILE_STEPS="${PROFILE_STEPS:-6}"
 OUT_DIR="${OUT_DIR:-results/phase8_overlap}"
 mkdir -p "${OUT_DIR}"
 
 COMMON_ARGS=(
-  --steps "${STEPS}"
   --batch-size "${BATCH}"
   --seq-len "${SEQ}"
   --hidden-size "${HIDDEN}"
@@ -46,6 +44,7 @@ COMMON_ARGS=(
   --mlp-ratio 4
   --dropout 0.0
   --log-interval 1
+  --warmup-discard 2
 )
 
 echo "[overlap-bench] commit=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
@@ -54,57 +53,47 @@ echo "[overlap-bench] tp=${TP_SIZE} hidden=${HIDDEN} layers=${LAYERS} heads=${HE
 
 run_one() {
   local tag="$1"
-  shift
+  local steps="$2"
+  shift 2
   local log="${OUT_DIR}/${tag}.log"
-  local summary="${OUT_DIR}/${tag}_summary.json"
-  echo "[overlap-bench] === ${tag} ==="
+  local metrics="${OUT_DIR}/${tag}_summary.json"
+  echo "[overlap-bench] === ${tag} (steps=${steps}) ==="
   set +e
-  ./scripts/run_tp.sh "${TP_SIZE}" "${COMMON_ARGS[@]}" "$@" 2>&1 | tee "${log}"
+  ./scripts/run_tp.sh "${TP_SIZE}" \
+    --steps "${steps}" \
+    "${COMMON_ARGS[@]}" \
+    --metrics-path "${metrics}" \
+    "$@" 2>&1 | tee "${log}"
   local rc=${PIPESTATUS[0]}
   set -e
   if [[ ${rc} -ne 0 ]]; then
     echo "[overlap-bench] FAILED ${tag} rc=${rc}" >&2
     return "${rc}"
   fi
-  # Extract the last JSON summary line from train.py (rank0 prints one object).
-  "${PYTHON_BIN}" - "${log}" "${summary}" <<'PY'
-import json, sys
-log_path, out_path = sys.argv[1], sys.argv[2]
-last = None
-with open(log_path) as f:
-    for line in f:
-        line = line.strip()
-        if line.startswith("{") and '"summary"' in line:
-            last = line
-if last is None:
-    raise SystemExit(f"no summary JSON found in {log_path}")
-obj = json.loads(last)
-with open(out_path, "w") as f:
-    json.dump(obj, f, indent=2)
-    f.write("\n")
-print(f"[overlap-bench] wrote {out_path}")
-PY
+  if [[ ! -f "${metrics}" ]]; then
+    echo "[overlap-bench] missing metrics file ${metrics}" >&2
+    return 1
+  fi
+  echo "[overlap-bench] wrote ${metrics}"
 }
 
 # Throughput runs — no profiler (published tokens/s).
-run_one "tp${TP_SIZE}_sync" 
-run_one "tp${TP_SIZE}_overlap" --overlap
+run_one "tp${TP_SIZE}_sync" "${STEPS}"
+run_one "tp${TP_SIZE}_overlap" "${STEPS}" --overlap
 
 # Short profiled runs — qualitative only; do NOT use for tokens/s claims.
 PROF_SYNC="${OUT_DIR}/profile_sync"
 PROF_OV="${OUT_DIR}/profile_overlap"
 mkdir -p "${PROF_SYNC}" "${PROF_OV}"
-run_one "tp${TP_SIZE}_sync_profiled" \
-  --steps "${PROFILE_STEPS}" \
+run_one "tp${TP_SIZE}_sync_profiled" "${PROFILE_STEPS}" \
   --profile-dir "${PROF_SYNC}" \
   --profile-wait 1 --profile-warmup 1 --profile-active 3
-run_one "tp${TP_SIZE}_overlap_profiled" \
+run_one "tp${TP_SIZE}_overlap_profiled" "${PROFILE_STEPS}" \
   --overlap \
-  --steps "${PROFILE_STEPS}" \
   --profile-dir "${PROF_OV}" \
   --profile-wait 1 --profile-warmup 1 --profile-active 3
 
-"${PYTHON_BIN}" - "${OUT_DIR}" "${TP_SIZE}" "${HIDDEN}" "${LAYERS}" "${HEADS}" "${BATCH}" "${SEQ}" "${STEPS}" "${WARMUP}" <<'PY'
+"${PYTHON_BIN}" - "${OUT_DIR}" "${TP_SIZE}" "${HIDDEN}" "${LAYERS}" "${HEADS}" "${BATCH}" "${SEQ}" "${STEPS}" <<'PY'
 import json, sys
 from pathlib import Path
 
@@ -116,13 +105,11 @@ meta = {
     "heads": int(sys.argv[5]),
     "batch": int(sys.argv[6]),
     "seq": int(sys.argv[7]),
-    "steps": int(sys.argv[8]),
-    "warmup_note": "train.py discards first warmup steps internally; see each summary",
+    "steps_throughput": int(sys.argv[8]),
 }
 
 def load(tag):
-    p = out / f"{tag}_summary.json"
-    with open(p) as f:
+    with open(out / f"{tag}_summary.json") as f:
         return json.load(f)
 
 sync = load(f"tp{meta['tp_size']}_sync")
@@ -149,8 +136,10 @@ cmp = {
         ),
         "backward_ms_sync": s_sum.get("avg_backward_ms"),
         "backward_ms_overlap": o_sum.get("avg_backward_ms"),
+        "forward_ms_sync": s_sum.get("avg_forward_ms"),
+        "forward_ms_overlap": o_sum.get("avg_forward_ms"),
     },
-    "environment_sync": sync.get("environment"),
+    "environment": sync.get("environment"),
     "note": (
         "Profiled runs under profile_*/ are qualitative only; "
         "do not cite their tokens/s. Compare Chrome traces for tp_all_reduce vs aten::mm."
