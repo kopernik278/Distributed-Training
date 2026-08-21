@@ -42,6 +42,7 @@ from .parallel_state import (
     initialize_model_parallel,
 )
 from .overlap import set_overlap_enabled
+from .profiler import maybe_profile
 
 
 def parse_args() -> argparse.Namespace:
