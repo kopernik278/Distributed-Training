@@ -35,6 +35,6 @@ In steady 1F1B, stage0 wants to **send** the next activation while stage1 wants 
 
 ## Next
 
-- Distributed Checkpoint (save/resume/reshard)
+- See Phase 5: `docs/phase5-distributed-checkpoint.md`
 - Profiling / communication-computation overlap
 - Optional larger-model PP scaling study on RunPod

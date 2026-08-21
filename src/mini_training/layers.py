@@ -17,8 +17,9 @@ from .parallel_state import (
 )
 
 
-def _set_tensor_parallel_attributes(tensor: torch.Tensor) -> None:
+def _set_tensor_parallel_attributes(tensor: torch.Tensor, partition_dim: int) -> None:
     setattr(tensor, "tensor_model_parallel", True)
+    setattr(tensor, "partition_dim", int(partition_dim))
 
 
 class ColumnParallelLinear(nn.Module):
@@ -53,9 +54,9 @@ class ColumnParallelLinear(nn.Module):
             self.register_parameter("bias", None)
 
         self.reset_parameters()
-        _set_tensor_parallel_attributes(self.weight)
+        _set_tensor_parallel_attributes(self.weight, partition_dim=0)
         if self.bias is not None:
-            _set_tensor_parallel_attributes(self.bias)
+            _set_tensor_parallel_attributes(self.bias, partition_dim=0)
 
     def reset_parameters(self) -> None:
         nn.init.normal_(self.weight, mean=0.0, std=0.02)
@@ -104,7 +105,7 @@ class RowParallelLinear(nn.Module):
             self.register_parameter("bias", None)
 
         self.reset_parameters()
-        _set_tensor_parallel_attributes(self.weight)
+        _set_tensor_parallel_attributes(self.weight, partition_dim=1)
 
     def reset_parameters(self) -> None:
         nn.init.normal_(self.weight, mean=0.0, std=0.02)

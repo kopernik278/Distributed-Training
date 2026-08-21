@@ -17,31 +17,31 @@ Cursor  +  GitHub  +  RunPod
 
 ## Current milestone
 
-**Project 1 / Phase 4: Pipeline Parallel + 1F1B**
+**Project 1 / Phase 5: Distributed Checkpoint (save / resume / TP reshard)**
 
 Completed:
 
-- Phase 1 DDP baseline + real 2x RTX 4090 NCCL measurements
-- Phase 2 Megatron-style Tensor Parallel
-- Phase 3 DP×TP 2D parallel
-- Phase 4 Pipeline stages + educational 1F1B engine (async P2P)
+- Phase 1 DDP baseline + RunPod NCCL measurements
+- Phase 2 Tensor Parallel
+- Phase 3 DP×TP
+- Phase 4 Pipeline Parallel + 1F1B (+ numeric + RunPod)
+- Phase 5 Sharded checkpoint, same-layout resume, TP reshard
 
 ## Repository layout
 
 ```text
 src/mini_training/
-  parallel_state.py   # dp × pp × tp groups
-  mappings.py / layers.py
-  model.py            # MiniTransformerLM + PipelineStage
-  pipeline.py         # 1F1B engine
+  parallel_state.py / mappings.py / layers.py
+  model.py / pipeline.py
+  checkpoint.py
   train.py
 scripts/
   run_tp.sh / run_dp_tp.sh / run_pp.sh
+  inspect_checkpoint.sh
 docs/
-  design/RFC-001 … RFC-004
-  phase2-tensor-parallel.md
-  phase3-dp-tp.md
-  phase4-pipeline-parallel.md
+  design/RFC-001 … RFC-005
+  phase2…phase5-*.md
+  experiments/
 ```
 
 ## Install
@@ -58,33 +58,25 @@ python3 -m unittest discover -s tests -v
 
 ## Run
 
-### Phase 1 style DDP
+### Phase 1–4 training
 
 ```bash
-NPROC_PER_NODE=2 ./scripts/run_single_node_ddp.sh --steps 10 --batch-size 4 --seq-len 128
+NPROC_PER_NODE=2 ./scripts/run_single_node_ddp.sh --steps 10
+./scripts/run_tp.sh 2 --steps 5 --hidden-size 64 --num-heads 8
+./scripts/run_dp_tp.sh 2 2 --steps 5 --hidden-size 64 --num-heads 8 --dropout 0.0
+./scripts/run_pp.sh 2 --steps 3 --num-layers 4 --num-microbatches 4 --dropout 0.0
 ```
 
-### Phase 2 Tensor Parallel
+### Phase 5 Checkpoint
 
 ```bash
-./scripts/run_tp.sh 2 --steps 5 --batch-size 2 --seq-len 64 --hidden-size 64 --num-heads 8
+./scripts/run_tp.sh 1 --steps 5 --checkpoint-dir checkpoints/demo --save-interval 2 ...
+./scripts/run_tp.sh 1 --steps 3 --resume checkpoints/demo ...
+./scripts/run_tp.sh 2 --steps 2 --resume checkpoints/demo ...   # TP reshard
+./scripts/inspect_checkpoint.sh checkpoints/demo
 ```
 
-### Phase 3 DP × TP
-
-```bash
-./scripts/run_dp_tp.sh 2 2 --steps 5 --batch-size 2 --seq-len 32 \
-  --hidden-size 64 --num-layers 2 --num-heads 8 --dropout 0.0
-```
-
-### Phase 4 Pipeline Parallel (1F1B)
-
-```bash
-./scripts/run_pp.sh 2 --steps 3 --batch-size 2 --seq-len 16 \
-  --hidden-size 32 --num-layers 4 --num-heads 4 --num-microbatches 4 --dropout 0.0
-```
-
-Measured RunPod results: [`docs/experiments/phase4-runpod-pp-results.md`](./docs/experiments/phase4-runpod-pp-results.md)
+Measured PP results: [`docs/experiments/phase4-runpod-pp-results.md`](./docs/experiments/phase4-runpod-pp-results.md)
 
 ## Important rule
 
@@ -92,6 +84,6 @@ Never report fabricated performance numbers. CPU/Gloo is for correctness; RunPod
 
 ## Next stages
 
-1. Distributed Checkpoint save/resume/reshard
-2. Profiling hooks and communication/computation overlap
-3. Optional: RunPod multi-GPU PP / 3D-parallel NCCL metrics
+1. Profiling hooks and communication/computation overlap
+2. Optional Adam-state TP reshard / PP consolidate
+3. Optional larger-model multi-GPU scaling studies

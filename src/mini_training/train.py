@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+from .checkpoint import load_checkpoint, save_checkpoint, unwrap_model
 from .config import TrainingConfig
 from .data import RandomTokenDataset
 from .distributed import (
@@ -77,6 +78,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-interval", type=int, default=1)
     parser.add_argument("--metrics-path", type=str, default="")
     parser.add_argument("--warmup-discard", type=int, default=1, help="Drop first N steps from summary averages")
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=str,
+        default="",
+        help="Directory for sharded checkpoints (step_XXXXXX/)",
+    )
+    parser.add_argument(
+        "--save-interval",
+        type=int,
+        default=0,
+        help="Save every N steps when --checkpoint-dir is set (0 disables periodic saves; final step still saved)",
+    )
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default="",
+        help="Resume from a step dir or a checkpoint root containing latest",
+    )
     return parser.parse_args()
 
 
@@ -307,14 +326,41 @@ def main() -> None:
     model = _wrap_ddp(model, device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+
+    start_step = 0
+    resumed_optimizer = False
+    if args.resume:
+        loaded_step, ckpt_meta, resumed_optimizer = load_checkpoint(
+            args.resume,
+            model=model,
+            optimizer=optimizer,
+            map_location=device,
+        )
+        # Keep DP replicas aligned after load/reshard.
+        broadcast_parameters_within_dp(unwrap_model(model))
+        start_step = loaded_step + 1
+        if is_main_process():
+            print(
+                json.dumps(
+                    {
+                        "event": "resume",
+                        "path": args.resume,
+                        "loaded_step": loaded_step,
+                        "start_step": start_step,
+                        "optimizer_loaded": resumed_optimizer,
+                        "checkpoint_parallel": ckpt_meta.get("parallel"),
+                    }
+                )
+            )
+
     # All PP ranks in a DP replica share the same microbatch stream (first uses
     # tokens, last uses targets; shapes must match for P2P).
     dataset = RandomTokenDataset(
         config,
         device,
-        seed=config.seed + 10_000 + get_data_parallel_rank(),
+        seed=config.seed + 10_000 + get_data_parallel_rank() + 1_000_000 * start_step,
     )
-    set_seed(config.seed + 20_000 + get_data_parallel_rank())
+    set_seed(config.seed + 20_000 + get_data_parallel_rank() + 1_000_000 * start_step)
 
     engine: PipelineEngine | None = None
     if use_pipeline:
@@ -346,7 +392,8 @@ def main() -> None:
             )
         )
 
-    for step in range(config.steps):
+    end_step = start_step + config.steps
+    for step in range(start_step, end_step):
         optimizer.zero_grad(set_to_none=True)
 
         with Timer(device) as step_timer:
@@ -396,6 +443,21 @@ def main() -> None:
 
         if is_main_process() and step % config.log_interval == 0:
             print(json.dumps(entry))
+
+        if args.checkpoint_dir:
+            should_save = step == end_step - 1
+            if args.save_interval > 0 and (step + 1) % args.save_interval == 0:
+                should_save = True
+            if should_save:
+                ckpt_path = save_checkpoint(
+                    args.checkpoint_dir,
+                    model=model,
+                    optimizer=optimizer,
+                    step=step,
+                    config=config,
+                )
+                if is_main_process():
+                    print(json.dumps({"event": "checkpoint", "path": str(ckpt_path), "step": step}))
 
     summary = summarize_metrics(metrics, args.warmup_discard)
     if is_main_process():
