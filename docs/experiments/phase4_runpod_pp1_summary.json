@@ -1,0 +1,47 @@
+{
+  "environment": {
+    "timestamp_utc": "2026-08-21T04:12:28.616589+00:00",
+    "commit": "2ecb7ab",
+    "python": "3.12.3",
+    "platform": "Linux-6.8.0-57-generic-x86_64-with-glibc2.39",
+    "pytorch": "2.8.0+cu128",
+    "cuda_available": true,
+    "device": "cuda:0",
+    "backend": "nccl",
+    "world_size": 1,
+    "rank": 0,
+    "local_rank": 0,
+    "tensor_parallel_size": 1,
+    "tensor_parallel_rank": 0,
+    "pipeline_parallel_size": 1,
+    "pipeline_parallel_rank": 0,
+    "data_parallel_size": 1,
+    "data_parallel_rank": 0,
+    "cuda_version": "12.8",
+    "gpu_name": "NVIDIA GeForce RTX 3090",
+    "gpu_count": 2,
+    "nccl_version": "2.27.3"
+  },
+  "summary": {
+    "num_steps": 18,
+    "warmup_discard": 2,
+    "avg_loss": 8.360988140106201,
+    "avg_step_time_ms": 9.735409616647908,
+    "avg_forward_ms": 3.0450120620015593,
+    "avg_backward_ms": 5.514668937798382,
+    "avg_optimizer_ms": 0.8264507794390537,
+    "avg_rank_tokens_per_second": 210427.60802860523,
+    "avg_global_tokens_per_second": 210427.60802860523
+  },
+  "config": {
+    "batch_size": 8,
+    "seq_len": 256,
+    "hidden_size": 256,
+    "num_layers": 4,
+    "num_heads": 8,
+    "pipeline_parallel_size": 1,
+    "num_microbatches": 1,
+    "tensor_parallel_size": 1,
+    "steps": 20
+  }
+}

@@ -84,6 +84,8 @@ NPROC_PER_NODE=2 ./scripts/run_single_node_ddp.sh --steps 10 --batch-size 4 --se
   --hidden-size 32 --num-layers 4 --num-heads 4 --num-microbatches 4 --dropout 0.0
 ```
 
+Measured RunPod results: [`docs/experiments/phase4-runpod-pp-results.md`](./docs/experiments/phase4-runpod-pp-results.md)
+
 ## Important rule
 
 Never report fabricated performance numbers. CPU/Gloo is for correctness; RunPod CUDA/NCCL is for portfolio measurements.

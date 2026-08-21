@@ -37,4 +37,4 @@ In steady 1F1B, stage0 wants to **send** the next activation while stage1 wants 
 
 - Distributed Checkpoint (save/resume/reshard)
 - Profiling / communication-computation overlap
-- Optional RunPod PP NCCL metrics when multi-GPU is available
+- Optional larger-model PP scaling study on RunPod
