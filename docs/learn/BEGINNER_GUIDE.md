@@ -153,6 +153,10 @@ the collective helper.
 
 Turn on with `--overlap`. Tiny CPU models will not get faster; this is a GPU pattern.
 
+On 2×4090 (hidden=1024, TP=2) we measured about **+4%** global tokens/s with
+`--overlap` vs sync — see `docs/experiments/phase8-runpod-overlap-results.md`.
+A second point with a smaller batch was slightly slower; overlap is not free.
+
 ---
 
 ## 8. How you can participate (practical)

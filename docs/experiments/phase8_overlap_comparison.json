@@ -1,0 +1,68 @@
+{
+  "workload": {
+    "tp_size": 2,
+    "hidden": 1024,
+    "layers": 8,
+    "heads": 16,
+    "batch": 4,
+    "seq": 512,
+    "steps_throughput": 30
+  },
+  "sync": {
+    "num_steps": 28,
+    "warmup_discard": 2,
+    "avg_loss": 8.43881172793252,
+    "avg_step_time_ms": 62.41012162510223,
+    "avg_forward_ms": 25.27175607195074,
+    "avg_backward_ms": 30.891091249681526,
+    "avg_optimizer_ms": 5.616699661394315,
+    "avg_rank_tokens_per_second": 33311.24853435647,
+    "avg_global_tokens_per_second": 33287.32306278803
+  },
+  "overlap": {
+    "num_steps": 28,
+    "warmup_discard": 2,
+    "avg_loss": 8.43881172793252,
+    "avg_step_time_ms": 59.657699608578696,
+    "avg_forward_ms": 24.16207898126491,
+    "avg_backward_ms": 29.123120108124567,
+    "avg_optimizer_ms": 5.714808804051635,
+    "avg_rank_tokens_per_second": 34821.194841875906,
+    "avg_global_tokens_per_second": 34687.87915070479
+  },
+  "delta": {
+    "step_time_ms_sync": 62.41012162510223,
+    "step_time_ms_overlap": 59.657699608578696,
+    "global_tok_s_sync": 33287.32306278803,
+    "global_tok_s_overlap": 34687.87915070479,
+    "tok_s_speedup_overlap_over_sync": 1.0420747587685248,
+    "backward_ms_sync": 30.891091249681526,
+    "backward_ms_overlap": 29.123120108124567,
+    "forward_ms_sync": 25.27175607195074,
+    "forward_ms_overlap": 24.16207898126491
+  },
+  "environment": {
+    "timestamp_utc": "2026-08-21T09:38:58.757351+00:00",
+    "commit": "84cb87f",
+    "python": "3.12.3",
+    "platform": "Linux-6.8.0-60-generic-x86_64-with-glibc2.39",
+    "pytorch": "2.8.0+cu128",
+    "cuda_available": true,
+    "device": "cuda:0",
+    "backend": "nccl",
+    "world_size": 2,
+    "rank": 0,
+    "local_rank": 0,
+    "tensor_parallel_size": 2,
+    "tensor_parallel_rank": 0,
+    "pipeline_parallel_size": 1,
+    "pipeline_parallel_rank": 0,
+    "data_parallel_size": 1,
+    "data_parallel_rank": 0,
+    "cuda_version": "12.8",
+    "gpu_name": "NVIDIA GeForce RTX 4090",
+    "gpu_count": 2,
+    "nccl_version": "2.27.3"
+  },
+  "note": "Profiled runs under profile_*/ are qualitative only; do not cite their tokens/s. Compare Chrome traces for tp_all_reduce vs aten::mm."
+}

@@ -33,5 +33,6 @@ Use Phase 6 traces on RunPod to *look* for NCCL under `aten::mm`.
 
 ## Next
 
-- Optional RunPod overlap vs no-overlap measurement on a larger hidden size
-- See Phase 8 for delayed RowParallel forward wait: `docs/phase8-delayed-rowparallel-reduce.md`
+- See Phase 8 delayed RowParallel wait + RunPod overlap measurement:
+  `docs/phase8-delayed-rowparallel-reduce.md`,
+  `docs/experiments/phase8-runpod-overlap-results.md`

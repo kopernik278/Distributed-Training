@@ -1,0 +1,65 @@
+{
+  "workload": {
+    "tp_size": 2,
+    "hidden": 2048,
+    "layers": 8,
+    "heads": 16,
+    "batch": 2,
+    "seq": 512,
+    "steps": 30
+  },
+  "sync": {
+    "num_steps": 28,
+    "warmup_discard": 2,
+    "avg_loss": 8.640184061867851,
+    "avg_step_time_ms": 81.11688128493759,
+    "avg_forward_ms": 26.084315054634185,
+    "avg_backward_ms": 34.982403767311816,
+    "avg_optimizer_ms": 19.434566680242174,
+    "avg_rank_tokens_per_second": 12639.435246542924,
+    "avg_global_tokens_per_second": 12657.966114013287
+  },
+  "overlap": {
+    "num_steps": 28,
+    "warmup_discard": 2,
+    "avg_loss": 8.640184061867851,
+    "avg_step_time_ms": 83.81998824994038,
+    "avg_forward_ms": 28.42147496448888,
+    "avg_backward_ms": 35.16896087551556,
+    "avg_optimizer_ms": 19.525272355687257,
+    "avg_rank_tokens_per_second": 12271.336251724802,
+    "avg_global_tokens_per_second": 12292.62876757518
+  },
+  "delta": {
+    "global_tok_s_sync": 12657.966114013287,
+    "global_tok_s_overlap": 12292.62876757518,
+    "tok_s_speedup_overlap_over_sync": 0.9711377528469086,
+    "backward_ms_sync": 34.982403767311816,
+    "backward_ms_overlap": 35.16896087551556,
+    "forward_ms_sync": 26.084315054634185,
+    "forward_ms_overlap": 28.42147496448888
+  },
+  "environment": {
+    "timestamp_utc": "2026-08-21T09:40:54.418541+00:00",
+    "commit": "84cb87f",
+    "python": "3.12.3",
+    "platform": "Linux-6.8.0-60-generic-x86_64-with-glibc2.39",
+    "pytorch": "2.8.0+cu128",
+    "cuda_available": true,
+    "device": "cuda:0",
+    "backend": "nccl",
+    "world_size": 2,
+    "rank": 0,
+    "local_rank": 0,
+    "tensor_parallel_size": 2,
+    "tensor_parallel_rank": 0,
+    "pipeline_parallel_size": 1,
+    "pipeline_parallel_rank": 0,
+    "data_parallel_size": 1,
+    "data_parallel_rank": 0,
+    "cuda_version": "12.8",
+    "gpu_name": "NVIDIA GeForce RTX 4090",
+    "gpu_count": 2,
+    "nccl_version": "2.27.3"
+  }
+}
