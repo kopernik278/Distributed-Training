@@ -48,5 +48,6 @@ On TP topology change, **model weights** are resharded; **optimizer state is re-
 
 ## Next
 
-- Profiling / communication-computation overlap
+- See Phase 6: `docs/phase6-profiling.md`
+- Communication/computation overlap
 - Optional Adam-state TP reshard + PP consolidate

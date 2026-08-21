@@ -8,6 +8,7 @@ from .parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from .profiler import record_range
 
 
 def _tp_group() -> dist.ProcessGroup | None:
@@ -39,14 +40,16 @@ def _gather_along_last_dim(input_: torch.Tensor) -> torch.Tensor:
         return input_
     group = _tp_group()
     tensor_list = [torch.empty_like(input_) for _ in range(tp_size)]
-    dist.all_gather(tensor_list, input_.contiguous(), group=group)
+    with record_range("tp_all_gather"):
+        dist.all_gather(tensor_list, input_.contiguous(), group=group)
     return torch.cat(tensor_list, dim=-1).contiguous()
 
 
 def _reduce(input_: torch.Tensor) -> torch.Tensor:
     if _tp_size() == 1:
         return input_
-    dist.all_reduce(input_, op=dist.ReduceOp.SUM, group=_tp_group())
+    with record_range("tp_all_reduce"):
+        dist.all_reduce(input_, op=dist.ReduceOp.SUM, group=_tp_group())
     return input_
 
 

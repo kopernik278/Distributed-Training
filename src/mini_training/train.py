@@ -41,7 +41,7 @@ from .parallel_state import (
     get_tensor_model_parallel_world_size,
     initialize_model_parallel,
 )
-from .pipeline import MicrobatchIO, PipelineEngine
+from .profiler import maybe_profile, profiler_step, record_range
 
 
 def parse_args() -> argparse.Namespace:
@@ -96,6 +96,15 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Resume from a step dir or a checkpoint root containing latest",
     )
+    parser.add_argument(
+        "--profile-dir",
+        type=str,
+        default="",
+        help="If set, export Chrome traces + a text table under this directory (slow; not for published tokens/s)",
+    )
+    parser.add_argument("--profile-wait", type=int, default=1, help="Profiler: steps to skip before warmup")
+    parser.add_argument("--profile-warmup", type=int, default=1, help="Profiler: warmup steps")
+    parser.add_argument("--profile-active", type=int, default=2, help="Profiler: recorded steps")
     return parser.parse_args()
 
 
@@ -388,76 +397,95 @@ def main() -> None:
                     "config": asdict(config),
                     "parameter_count": parameter_count,
                     "environment": environment,
+                    "profiling": bool(args.profile_dir),
                 }
             )
         )
 
     end_step = start_step + config.steps
-    for step in range(start_step, end_step):
-        optimizer.zero_grad(set_to_none=True)
+    with maybe_profile(
+        enabled=bool(args.profile_dir),
+        profile_dir=args.profile_dir or ".",
+        device=device,
+        wait=args.profile_wait,
+        warmup=args.profile_warmup,
+        active=args.profile_active,
+        rank=get_rank(),
+    ) as prof:
+        for step in range(start_step, end_step):
+            optimizer.zero_grad(set_to_none=True)
 
-        with Timer(device) as step_timer:
-            if engine is not None:
-                loss_value, forward_s, backward_s = _run_pipeline_step(engine, dataset, config, device)
-                loss_value = _sync_pipeline_loss(loss_value, device)
-            else:
-                loss_value, forward_s, backward_s = _run_non_pipeline_step(model, dataset, config, device)
+            with record_range("train_step"):
+                with Timer(device) as step_timer:
+                    if engine is not None:
+                        with record_range("pipeline_1f1b"):
+                            loss_value, forward_s, backward_s = _run_pipeline_step(
+                                engine, dataset, config, device
+                            )
+                        loss_value = _sync_pipeline_loss(loss_value, device)
+                    else:
+                        loss_value, forward_s, backward_s = _run_non_pipeline_step(
+                            model, dataset, config, device
+                        )
 
-            lr = linear_warmup_lr(step, config)
-            for param_group in optimizer.param_groups:
-                param_group["lr"] = lr
+                    lr = linear_warmup_lr(step, config)
+                    for param_group in optimizer.param_groups:
+                        param_group["lr"] = lr
 
-            with Timer(device) as optimizer_timer:
-                optimizer.step()
-            optimizer_s = optimizer_timer.elapsed_s
+                    with Timer(device) as optimizer_timer:
+                        with record_range("optimizer_step"):
+                            optimizer.step()
+                    optimizer_s = optimizer_timer.elapsed_s
 
-        step_time_s = step_timer.elapsed_s
-        local_tokens = config.tokens_per_step_per_rank
-        global_tokens = float(local_tokens * get_data_parallel_world_size())
-        avg_loss = reduce_mean(loss_value, device)
-        avg_step_time_s = reduce_mean(step_time_s, device)
-        avg_forward_s = reduce_mean(forward_s, device)
-        avg_backward_s = reduce_mean(backward_s, device)
-        avg_optimizer_s = reduce_mean(optimizer_s, device)
-        global_tokens_per_second = global_tokens / avg_step_time_s
-        rank_tokens_per_second = local_tokens / step_time_s
+            profiler_step(prof)
 
-        entry: dict[str, float | int] = {
-            "step": step,
-            "rank": get_rank(),
-            "world_size": get_world_size(),
-            "tensor_parallel_size": get_tensor_model_parallel_world_size(),
-            "pipeline_parallel_size": get_pipeline_model_parallel_world_size(),
-            "data_parallel_size": get_data_parallel_world_size(),
-            "num_microbatches": config.num_microbatches if use_pipeline else 1,
-            "loss": avg_loss,
-            "lr": lr,
-            "step_time_ms": avg_step_time_s * 1000.0,
-            "forward_ms": avg_forward_s * 1000.0,
-            "backward_ms": avg_backward_s * 1000.0,
-            "optimizer_ms": avg_optimizer_s * 1000.0,
-            "rank_tokens_per_second": rank_tokens_per_second,
-            "global_tokens_per_second": global_tokens_per_second,
-        }
-        metrics.append(entry)
+            step_time_s = step_timer.elapsed_s
+            local_tokens = config.tokens_per_step_per_rank
+            global_tokens = float(local_tokens * get_data_parallel_world_size())
+            avg_loss = reduce_mean(loss_value, device)
+            avg_step_time_s = reduce_mean(step_time_s, device)
+            avg_forward_s = reduce_mean(forward_s, device)
+            avg_backward_s = reduce_mean(backward_s, device)
+            avg_optimizer_s = reduce_mean(optimizer_s, device)
+            global_tokens_per_second = global_tokens / avg_step_time_s
+            rank_tokens_per_second = local_tokens / step_time_s
 
-        if is_main_process() and step % config.log_interval == 0:
-            print(json.dumps(entry))
+            entry: dict[str, float | int] = {
+                "step": step,
+                "rank": get_rank(),
+                "world_size": get_world_size(),
+                "tensor_parallel_size": get_tensor_model_parallel_world_size(),
+                "pipeline_parallel_size": get_pipeline_model_parallel_world_size(),
+                "data_parallel_size": get_data_parallel_world_size(),
+                "num_microbatches": config.num_microbatches if use_pipeline else 1,
+                "loss": avg_loss,
+                "lr": lr,
+                "step_time_ms": avg_step_time_s * 1000.0,
+                "forward_ms": avg_forward_s * 1000.0,
+                "backward_ms": avg_backward_s * 1000.0,
+                "optimizer_ms": avg_optimizer_s * 1000.0,
+                "rank_tokens_per_second": rank_tokens_per_second,
+                "global_tokens_per_second": global_tokens_per_second,
+            }
+            metrics.append(entry)
 
-        if args.checkpoint_dir:
-            should_save = step == end_step - 1
-            if args.save_interval > 0 and (step + 1) % args.save_interval == 0:
-                should_save = True
-            if should_save:
-                ckpt_path = save_checkpoint(
-                    args.checkpoint_dir,
-                    model=model,
-                    optimizer=optimizer,
-                    step=step,
-                    config=config,
-                )
-                if is_main_process():
-                    print(json.dumps({"event": "checkpoint", "path": str(ckpt_path), "step": step}))
+            if is_main_process() and step % config.log_interval == 0:
+                print(json.dumps(entry))
+
+            if args.checkpoint_dir:
+                should_save = step == end_step - 1
+                if args.save_interval > 0 and (step + 1) % args.save_interval == 0:
+                    should_save = True
+                if should_save:
+                    ckpt_path = save_checkpoint(
+                        args.checkpoint_dir,
+                        model=model,
+                        optimizer=optimizer,
+                        step=step,
+                        config=config,
+                    )
+                    if is_main_process():
+                        print(json.dumps({"event": "checkpoint", "path": str(ckpt_path), "step": step}))
 
     summary = summarize_metrics(metrics, args.warmup_discard)
     if is_main_process():

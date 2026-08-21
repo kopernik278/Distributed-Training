@@ -6,6 +6,7 @@ import torch
 import torch.distributed as dist
 
 from .model import cross_entropy_loss
+from .profiler import record_range
 from .parallel_state import (
     get_pipeline_model_parallel_next_rank,
     get_pipeline_model_parallel_prev_rank,
@@ -68,13 +69,15 @@ class PipelineEngine:
         prev = get_pipeline_model_parallel_prev_rank()
         assert prev is not None
         buf = torch.empty(batch_size, seq_len, self.hidden_size, dtype=self.dtype, device=device)
-        dist.recv(buf, src=prev)
+        with record_range("pp_recv_forward"):
+            dist.recv(buf, src=prev)
         return buf
 
     def _send_forward_async(self, hidden: torch.Tensor) -> dist.Work:
         nxt = get_pipeline_model_parallel_next_rank()
         assert nxt is not None
-        return dist.isend(hidden.contiguous(), dst=nxt)
+        with record_range("pp_isend_forward"):
+            return dist.isend(hidden.contiguous(), dst=nxt)
 
     def _recv_backward_async(
         self, batch_size: int, seq_len: int, device: torch.device
@@ -82,12 +85,15 @@ class PipelineEngine:
         nxt = get_pipeline_model_parallel_next_rank()
         assert nxt is not None
         buf = torch.empty(batch_size, seq_len, self.hidden_size, dtype=self.dtype, device=device)
-        return buf, dist.irecv(buf, src=nxt)
+        with record_range("pp_irecv_backward"):
+            work = dist.irecv(buf, src=nxt)
+        return buf, work
 
     def _send_backward_async(self, grad: torch.Tensor) -> dist.Work:
         prev = get_pipeline_model_parallel_prev_rank()
         assert prev is not None
-        return dist.isend(grad.contiguous(), dst=prev)
+        with record_range("pp_isend_backward"):
+            return dist.isend(grad.contiguous(), dst=prev)
 
     def _forward_microbatch(
         self, mb: MicrobatchIO, device: torch.device
