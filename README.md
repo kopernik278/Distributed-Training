@@ -8,10 +8,13 @@ If you are **not** already an infra engineer, start here:
 
 ## Current milestone
 
-**Project 1 / Phase 9: Sequence Parallel + Vocab Parallel**
+**Project 1 complete (Phases 1–9) + engineering enhancement suite**
 
-Phases 1–8: DDP, TP, DP×TP, Pipeline 1F1B, Checkpoint, Profiler, Comm overlap,
-delayed RowParallel wait (+ RunPod overlap measurement).
+DDP, TP, DP×TP, Pipeline 1F1B, Checkpoint, Profiler, Comm overlap, delayed
+RowParallel wait, Sequence/Vocab Parallel — with WikiText-2 and RunPod GPU
+measurements.
+
+**Final report:** [`docs/reports/FINAL_ENGINEERING_REPORT.md`](./docs/reports/FINAL_ENGINEERING_REPORT.md)
 
 ## Tests
 
@@ -19,6 +22,16 @@ delayed RowParallel wait (+ RunPod overlap measurement).
 python3 -m pip install -e .
 python3 -m unittest discover -s tests -v
 ```
+
+## Engineering GPU suite
+
+```bash
+# On a multi-GPU host (e.g. RunPod 2×/4×4090), after install:
+GPU_COUNT=2 PROFILE=0 ./scripts/benchmark_engineering_suite.sh
+```
+
+Results land under `results/engineering_suite/` (summarized JSON + markdown).
+Committed samples: `docs/experiments/engineering_suite/`.
 
 ## Sequence / Vocab parallel (opt-in)
 
@@ -29,9 +42,10 @@ BACKEND=gloo ./scripts/run_tp.sh 2 --steps 3 --seq-len 64 --hidden-size 64 \
 
 Requires `tp>1`, `seq_len % tp == 0`, and for VP `vocab_size % tp == 0`.
 
-## Next stages
+## Next stages (optional)
 
-1. Optional Adam-state TP reshard / PP consolidate
-2. Optional RunPod memory footprint comparison with `--sequence-parallel`
+1. Multi-node / NVLink hosts for positive DDP scaling and eng-seq PP
+2. Adam-state TP reshard / PP consolidate
+3. Activation-memory comparison with `--sequence-parallel`
 
 Overlap GPU measurement: [`docs/experiments/phase8-runpod-overlap-results.md`](./docs/experiments/phase8-runpod-overlap-results.md).

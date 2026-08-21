@@ -1,0 +1,4 @@
+# gpu2_pp (eng defaults seq=512 batch=2 mb=4) FAILED / hung on NODE PCIe host
+# Fixed imports: PipelineEngine + MicrobatchIO (commits 352d3c9, 5f28bd8)
+# Successful replacements: gpu2_pp_mid.json, gpu2_pp_reduced.json
+# Suite script now launches reduced PP shape by default.

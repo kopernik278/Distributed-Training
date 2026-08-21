@@ -107,9 +107,16 @@ if [[ "${GPU_COUNT}" -ge 2 ]]; then
   run_case "gpu2_tp_sp_vp" \
     ./scripts/run_tp.sh 2 "${COMMON[@]}" --sequence-parallel --vocab-parallel
 
-  # PP needs layers % pp == 0 (12 % 2 == 0)
+  # PP needs layers % pp == 0. Full eng seq=512/batch=2/mb=4 can stall on
+  # weak NODE/PCIe fabrics; use a reduced shape that still exercises 1F1B.
+  # Prefer NCCL_P2P_DISABLE=1 on non-NVLink consumer GPUs when hangs appear.
   run_case "gpu2_pp" \
-    ./scripts/run_pp.sh 2 "${COMMON[@]}" --num-microbatches 4
+    env NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-1}" NCCL_IGNORE_DISABLED_P2P=1 \
+    ./scripts/run_pp.sh 2 \
+      --dataset wikitext2 --data-dir "${DATA_DIR}" --steps "${STEPS}" --warmup-discard 3 \
+      --batch-size 1 --seq-len 256 --hidden-size "${HIDDEN}" --num-layers "${LAYERS}" \
+      --num-heads "${HEADS}" --mlp-ratio "${MLP_RATIO}" --vocab-size "${VOCAB}" \
+      --dropout 0.0 --log-interval 5 --num-microbatches 2
 fi
 
 if [[ "${GPU_COUNT}" -ge 4 ]]; then
