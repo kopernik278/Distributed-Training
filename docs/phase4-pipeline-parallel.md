@@ -29,6 +29,9 @@ In steady 1F1B, stage0 wants to **send** the next activation while stage1 wants 
 - Shared microbatch stream across PP ranks (same data seed within a DP replica)
 - Loss computed only on last stage, then broadcast for metrics
 - Local grads exist on every stage after one 1F1B step
+- **Numeric check**: `test_pp2_matches_dense_loss_and_grads` compares PP=2 loss + stage
+  grads against an **untied** dense `MiniTransformerLM` on the same microbatches
+  (`loss_err < 1e-5`, `max_grad_err < 1e-4`)
 
 ## Next
 
