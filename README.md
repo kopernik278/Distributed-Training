@@ -8,11 +8,11 @@ If you are **not** already an infra engineer, start here:
 
 ## Current milestone
 
-**Project 1 complete (Phases 1–9) + engineering enhancement suite**
+**Project 1 complete (Phases 1–9) + engineering enhancement (base + XL)**
 
 DDP, TP, DP×TP, Pipeline 1F1B, Checkpoint, Profiler, Comm overlap, delayed
-RowParallel wait, Sequence/Vocab Parallel — with WikiText-2 and RunPod GPU
-measurements.
+RowParallel wait, Sequence/Vocab Parallel — validated on RunPod with WikiText-2
+(~160M) and WikiText-103 (~479M XL).
 
 **Final report:** [`docs/reports/FINAL_ENGINEERING_REPORT.md`](./docs/reports/FINAL_ENGINEERING_REPORT.md)
 
@@ -23,15 +23,17 @@ python3 -m pip install -e .
 python3 -m unittest discover -s tests -v
 ```
 
-## Engineering GPU suite
+## Engineering GPU suites
 
 ```bash
-# On a multi-GPU host (e.g. RunPod 2×/4×4090), after install:
-GPU_COUNT=2 PROFILE=0 ./scripts/benchmark_engineering_suite.sh
+# Base (~160M, WikiText-2)
+GPU_COUNT=2 ./scripts/benchmark_engineering_suite.sh
+
+# XL (~479M, WikiText-103)
+./scripts/benchmark_engineering_xl.sh
 ```
 
-Results land under `results/engineering_suite/` (summarized JSON + markdown).
-Committed samples: `docs/experiments/engineering_suite/`.
+Committed samples: `docs/experiments/engineering_suite/`, `docs/experiments/engineering_suite_xl/`.
 
 ## Sequence / Vocab parallel (opt-in)
 
