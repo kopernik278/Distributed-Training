@@ -37,5 +37,6 @@ Tiny CPU models will not speed up; use GPU traces to see NCCL under GEMM.
 ## Next stages
 
 1. Optional Adam-state TP reshard / PP consolidate
-2. Optional larger-model multi-GPU overlap measurements
-3. Sequence / vocab parallel
+2. Sequence / vocab parallel
+
+Overlap GPU measurement (2×4090): [`docs/experiments/phase8-runpod-overlap-results.md`](./docs/experiments/phase8-runpod-overlap-results.md).
