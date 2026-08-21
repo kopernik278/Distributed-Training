@@ -167,7 +167,7 @@ PP numbers are **not** on the identical seq/batch schedule; compare PP only with
 1. **Single-node only** in completed measurements; multi-node not stocked for Instant Clusters in this pass.  
 2. **No NVLink** on measured 4090 pairs — numbers are interconnect-bound.  
 3. **Eng-default PP** hangs on this fabric; mid/reduced PP used instead.  
-4. **4-GPU suite** was started on a separate pod; results are attached when the run finishes (see `engineering_suite_4gpu/` if present).  
+4. **4×4090 pod** was rented but unusable for PyTorch (CUDA init failure); no 4-GPU numbers are claimed.  
 5. Profiled tok/s must never be cited as performance.
 
 ---

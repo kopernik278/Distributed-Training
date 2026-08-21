@@ -13,7 +13,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from .checkpoint import load_checkpoint, save_checkpoint, unwrap_model
 from .config import TrainingConfig
-from .data import RandomTokenDataset, WikiText2Dataset, build_dataset
+from .data import PackedTextDataset, RandomTokenDataset, WikiText2Dataset, build_dataset
 from .distributed import (
     Timer,
     barrier,
@@ -140,14 +140,14 @@ def parse_args() -> argparse.Namespace:
         "--dataset",
         type=str,
         default="random",
-        choices=["random", "wikitext2"],
-        help="Training data: synthetic random tokens or WikiText-2 (downloaded on demand)",
+        choices=["random", "wikitext2", "wikitext103"],
+        help="Training data: random | WikiText-2 | WikiText-103 (downloaded on demand)",
     )
     parser.add_argument(
         "--data-dir",
         type=str,
         default="data",
-        help="Cache directory for real datasets (WikiText-2)",
+        help="Cache directory for real datasets (WikiText-2 / WikiText-103)",
     )
     return parser.parse_args()
 
@@ -318,7 +318,7 @@ def _wrap_ddp(model: torch.nn.Module, device: torch.device, config: TrainingConf
 
 def _run_non_pipeline_step(
     model: torch.nn.Module,
-    dataset: RandomTokenDataset | WikiText2Dataset,
+    dataset: RandomTokenDataset | PackedTextDataset,
     config: TrainingConfig,
     device: torch.device,
 ) -> tuple[float, float, float]:
@@ -345,7 +345,7 @@ def _run_non_pipeline_step(
 
 def _run_pipeline_step(
     engine: PipelineEngine,
-    dataset: RandomTokenDataset | WikiText2Dataset,
+    dataset: RandomTokenDataset | PackedTextDataset,
     config: TrainingConfig,
     device: torch.device,
 ) -> tuple[float, float, float]:

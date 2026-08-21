@@ -1,17 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Engineering suite: larger model + WikiText-2 + multi-config GPU benchmarks.
+# Engineering suite: larger model + real text + multi-config GPU benchmarks.
 # Records real metrics via --metrics-path; never invents numbers.
 #
 # Usage (on a multi-GPU RunPod node after bootstrap):
 #   ./scripts/benchmark_engineering_suite.sh
 #   GPU_COUNT=4 OUT_DIR=results/engineering_suite ./scripts/benchmark_engineering_suite.sh
+#   SCALE=xl DATASET=wikitext103 OUT_DIR=results/engineering_suite_xl ./scripts/benchmark_engineering_suite.sh
 #
 # Env knobs:
 #   GPU_COUNT   visible GPUs to use (default: torch.cuda.device_count or 2)
 #   STEPS       throughput steps (default 40)
 #   PROFILE     if 1, also emit short profiled runs for one TP config
+#   SCALE       base (default) | xl  (larger hidden/layers/vocab; smaller batch)
+#   DATASET     wikitext2 (default) | wikitext103 | random
+#   HIDDEN/LAYERS/HEADS/SEQ/BATCH/VOCAB  override model knobs
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
@@ -29,6 +33,8 @@ OUT_DIR="${OUT_DIR:-results/engineering_suite}"
 STEPS="${STEPS:-40}"
 PROFILE="${PROFILE:-0}"
 DATA_DIR="${DATA_DIR:-data}"
+DATASET="${DATASET:-wikitext2}"
+SCALE="${SCALE:-base}"
 mkdir -p "${OUT_DIR}"
 
 GPU_COUNT="${GPU_COUNT:-}"
@@ -40,17 +46,26 @@ PY
 )"
 fi
 
-# Large-ish model that fits 2×24GB with TP=2 / batch=2.
-HIDDEN="${HIDDEN:-1024}"
-LAYERS="${LAYERS:-12}"
-HEADS="${HEADS:-16}"
-SEQ="${SEQ:-512}"
-BATCH="${BATCH:-2}"
-VOCAB="${VOCAB:-8192}"
+# base: ~160M dense LM. xl: ~350M-class (fits 2×24GB with TP=2, batch=1).
+if [[ "${SCALE}" == "xl" ]]; then
+  HIDDEN="${HIDDEN:-1536}"
+  LAYERS="${LAYERS:-16}"
+  HEADS="${HEADS:-16}"
+  SEQ="${SEQ:-512}"
+  BATCH="${BATCH:-1}"
+  VOCAB="${VOCAB:-16384}"
+else
+  HIDDEN="${HIDDEN:-1024}"
+  LAYERS="${LAYERS:-12}"
+  HEADS="${HEADS:-16}"
+  SEQ="${SEQ:-512}"
+  BATCH="${BATCH:-2}"
+  VOCAB="${VOCAB:-8192}"
+fi
 MLP_RATIO="${MLP_RATIO:-4}"
 
 COMMON=(
-  --dataset wikitext2
+  --dataset "${DATASET}"
   --data-dir "${DATA_DIR}"
   --steps "${STEPS}"
   --warmup-discard 3
@@ -66,7 +81,7 @@ COMMON=(
 )
 
 echo "[eng-suite] commit=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
-echo "[eng-suite] gpus=${GPU_COUNT} out=${OUT_DIR}"
+echo "[eng-suite] gpus=${GPU_COUNT} out=${OUT_DIR} scale=${SCALE} dataset=${DATASET}"
 echo "[eng-suite] model hidden=${HIDDEN} layers=${LAYERS} heads=${HEADS} seq=${SEQ} batch=${BATCH} vocab=${VOCAB}"
 
 run_case() {
@@ -113,7 +128,7 @@ if [[ "${GPU_COUNT}" -ge 2 ]]; then
   run_case "gpu2_pp" \
     env NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-1}" NCCL_IGNORE_DISABLED_P2P=1 \
     ./scripts/run_pp.sh 2 \
-      --dataset wikitext2 --data-dir "${DATA_DIR}" --steps "${STEPS}" --warmup-discard 3 \
+      --dataset "${DATASET}" --data-dir "${DATA_DIR}" --steps "${STEPS}" --warmup-discard 3 \
       --batch-size 1 --seq-len 256 --hidden-size "${HIDDEN}" --num-layers "${LAYERS}" \
       --num-heads "${HEADS}" --mlp-ratio "${MLP_RATIO}" --vocab-size "${VOCAB}" \
       --dropout 0.0 --log-interval 5 --num-microbatches 2
@@ -141,5 +156,6 @@ if [[ "${PROFILE}" == "1" && "${GPU_COUNT}" -ge 2 ]]; then
 fi
 
 "${PYTHON_BIN}" "${ROOT_DIR}/scripts/summarize_engineering_suite.py" "${OUT_DIR}"
+"${PYTHON_BIN}" "${ROOT_DIR}/scripts/analyze_engineering_suite.py" "${OUT_DIR}"
 
-echo "[eng-suite] done → ${OUT_DIR}/suite_summary.json / suite_report.md"
+echo "[eng-suite] done → ${OUT_DIR}/suite_summary.json / suite_report.md / suite_analysis.md"
