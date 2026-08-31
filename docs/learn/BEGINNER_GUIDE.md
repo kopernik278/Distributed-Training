@@ -1,8 +1,5 @@
 # Learning Guide: Mini Distributed Training Engine
 
-> Audience: you are learning AI Infra, not already a senior training-systems engineer.
-> Read this **before** diving into RFC files. Code citations use repo paths.
-
 This project is a **tiny Megatron-style training engine**. The model is small on purpose.
 The point is to *see* DDP, Tensor Parallel, Pipeline Parallel, checkpointing, and profiling
 without 70B-parameter noise.
